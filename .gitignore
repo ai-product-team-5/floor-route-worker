@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# Wrangler local state
+.wrangler/
+
+# local environment / secrets
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+
+# generated local test files
+seed-test-key.sql
+test-corner.json
+test-search.json
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
