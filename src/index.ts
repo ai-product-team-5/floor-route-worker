@@ -220,7 +220,8 @@ async function callImageEdit(imageDataUrl: string, destination: string): Promise
 - 识别所有墙壁（构成房间边界的黑色实线）。
 - 识别走廊和可通行区域（房间之间的空白/灰色开放区域）。
 - 识别门（墙壁上的缺口/开口）。
-- 找到"当前位置"标记或主入口。
+- 找到图例（Legend），查看"当前位置"对应的图标/标记样式。
+- 在平面图中找到该标记所在的位置，作为路线起点。
 - 找到目的地："${destination}"。
 
 第二步 - 规划路线：
