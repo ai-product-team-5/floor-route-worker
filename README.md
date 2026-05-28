@@ -1,21 +1,99 @@
-```txt
+# FloorRoute API Server
+
+方寸识途后端 API 服务。基于 Hono + libsql (SQLite)，部署在 VPS 上。
+
+## API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/credits` | 查询剩余算力 |
+| POST | `/api/corner` | 检测平面图四角坐标 |
+| POST | `/api/search` | 搜索目的地候选 |
+| POST | `/api/path` | 生成导航路线图 |
+
+所有 `/api/*` 请求需要 `Authorization: Bearer fr_live_xxx` header。
+
+## 部署步骤
+
+### 1. 安装 Node.js
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
+```
+
+### 2. 克隆项目
+
+```bash
+cd /opt
+git clone https://github.com/ai-product-team-5/floor-route-worker.git
+cd floor-route-worker
 npm install
+```
+
+### 3. 配置环境变量
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+填入你的 OpenRouter API Key 和模型配置。
+
+### 4. 初始化数据库并启动
+
+```bash
+mkdir -p data
+node --env-file=.env --import=tsx src/index.ts
+```
+
+### 5. 生成 API Key
+
+```bash
+node scripts/create-test-key.mjs
+node --env-file=.env --import=tsx -e "
+import { createClient } from '@libsql/client';
+import { readFileSync } from 'fs';
+const db = createClient({ url: process.env.DB_URL });
+await db.executeMultiple(readFileSync('seed-test-key.sql', 'utf8'));
+console.log('Key inserted.');
+"
+```
+
+记下打印的 `fr_live_xxx`，这是前端使用的 API Key。
+
+### 6. 后台运行（生产环境）
+
+```bash
+npm install -g pm2
+pm2 start "node --env-file=.env --import=tsx src/index.ts" --name floor-route-api
+pm2 save
+pm2 startup
+```
+
+## 本地开发
+
+```bash
+npm install
+mkdir -p data
 npm run dev
 ```
 
-```txt
-npm run deploy
-```
+## 环境变量
 
-[For generating/synchronizing types based on your Worker configuration run](https://developers.cloudflare.com/workers/wrangler/commands/#types):
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `PORT` | 服务端口 | `8080` |
+| `DB_URL` | SQLite 数据库路径 | `file:./data/floor-route.db` |
+| `VISION_MODEL_BASE_URL` | 视觉模型 API 地址 | `https://openrouter.ai/api/v1` |
+| `VISION_MODEL_API_KEY` | 视觉模型 API Key | `sk-or-xxx` |
+| `VISION_MODEL_NAME` | 视觉模型名称 | `qwen/qwen2.5-vl-72b-instruct` |
+| `IMAGE_MODEL_BASE_URL` | 图像生成模型 API 地址 | `https://openrouter.ai/api/v1` |
+| `IMAGE_MODEL_API_KEY` | 图像生成模型 API Key | `sk-or-xxx` |
+| `IMAGE_MODEL_NAME` | 图像生成模型名称 | `openai/gpt-5.4-image-2` |
 
-```txt
-npm run cf-typegen
-```
+## 技术栈
 
-Pass the `CloudflareBindings` as generics when instantiating `Hono`:
-
-```ts
-// src/index.ts
-const app = new Hono<{ Bindings: CloudflareBindings }>()
-```
+- [Hono](https://hono.dev/) - Web 框架
+- [@libsql/client](https://github.com/tursodatabase/libsql-client-ts) - SQLite 数据库
+- [OpenRouter](https://openrouter.ai/) - AI 模型网关

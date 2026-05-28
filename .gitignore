@@ -8,7 +8,7 @@ node_modules/
 .dev.vars
 .dev.vars.*
 .env
-.env.*
+!.env.example
 
 # generated local test files
 seed-test-key.sql
