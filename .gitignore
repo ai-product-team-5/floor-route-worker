@@ -15,6 +15,12 @@ seed-test-key.sql
 test-corner.json
 test-search.json
 
+# database
+data/
+
+# build output
+dist/
+
 # logs
 *.log
 npm-debug.log*
