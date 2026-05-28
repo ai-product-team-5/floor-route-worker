@@ -214,13 +214,29 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 async function callImageEdit(imageDataUrl: string, destination: string): Promise<string> {
-  const prompt = `
-This is an indoor floor plan image.
-Draw a clear red dashed line on the image showing the best walking route from the current location (near the entrance) to "${destination}".
-The route must follow corridors and walkways, and must not pass through walls.
-Mark the starting point with a green dot and the destination with a red dot.
-Keep the original floor plan clearly visible.
-`
+  const prompt = `You are looking at an indoor floor plan. Your task is to draw a navigation route on this image.
+
+STEP 1 - ANALYZE THE FLOOR PLAN:
+- Identify all walls (solid black lines forming room boundaries).
+- Identify corridors and walkable spaces (the open white/gray areas BETWEEN rooms).
+- Identify doors (gaps/openings in walls).
+- Locate the "当前位置" (Current Location) marker or the main entrance.
+- Locate the destination: "${destination}".
+
+STEP 2 - PLAN THE ROUTE:
+- The route MUST ONLY go through corridors and door openings.
+- The route MUST NEVER cross or pass through any wall (solid black line).
+- Use the corridor network to navigate from start to destination.
+- Choose the shortest path that stays within walkable areas.
+
+STEP 3 - DRAW THE ROUTE:
+- Draw a thick red dashed line (---) along the planned route.
+- The line must stay in the middle of corridors, never touching walls.
+- Mark the starting point with a green circle.
+- Mark the destination with a red circle.
+- Keep the original floor plan fully visible and unmodified underneath.
+
+IMPORTANT: Walls are barriers. The route must go AROUND rooms via corridors, never through them.`
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
