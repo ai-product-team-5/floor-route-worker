@@ -214,29 +214,29 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 async function callImageEdit(imageDataUrl: string, destination: string): Promise<string> {
-  const prompt = `You are looking at an indoor floor plan. Your task is to draw a navigation route on this image.
+  const prompt = `你正在查看一张室内平面图。你的任务是在图上绘制一条导航路线。
 
-STEP 1 - ANALYZE THE FLOOR PLAN:
-- Identify all walls (solid black lines forming room boundaries).
-- Identify corridors and walkable spaces (the open white/gray areas BETWEEN rooms).
-- Identify doors (gaps/openings in walls).
-- Locate the "当前位置" (Current Location) marker or the main entrance.
-- Locate the destination: "${destination}".
+第一步 - 分析平面图：
+- 识别所有墙壁（构成房间边界的黑色实线）。
+- 识别走廊和可通行区域（房间之间的空白/灰色开放区域）。
+- 识别门（墙壁上的缺口/开口）。
+- 找到"当前位置"标记或主入口。
+- 找到目的地："${destination}"。
 
-STEP 2 - PLAN THE ROUTE:
-- The route MUST ONLY go through corridors and door openings.
-- The route MUST NEVER cross or pass through any wall (solid black line).
-- Use the corridor network to navigate from start to destination.
-- Choose the shortest path that stays within walkable areas.
+第二步 - 规划路线：
+- 路线只能经过走廊和门洞。
+- 路线绝对不能穿过任何墙壁（黑色实线）。
+- 利用走廊网络从起点导航到目的地。
+- 选择在可通行区域内的最短路径。
 
-STEP 3 - DRAW THE ROUTE:
-- Draw a thick red dashed line (---) along the planned route.
-- The line must stay in the middle of corridors, never touching walls.
-- Mark the starting point with a green circle.
-- Mark the destination with a red circle.
-- Keep the original floor plan fully visible and unmodified underneath.
+第三步 - 绘制路线：
+- 沿规划路线画一条粗红色虚线（---）。
+- 线条必须保持在走廊中间，不能接触墙壁。
+- 用绿色圆点标记起点。
+- 用红色圆点标记目的地。
+- 保持原始平面图完全可见，不做任何修改。
 
-IMPORTANT: Walls are barriers. The route must go AROUND rooms via corridors, never through them.`
+重要：墙壁是障碍物。路线必须通过走廊绕过房间，绝不能穿过房间。`
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
