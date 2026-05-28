@@ -169,7 +169,7 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
         messages: [
           {
             role: 'system',
-            content: '你是一个严格的 JSON API。你只能输出合法 JSON，不要输出 Markdown，不要输出解释。',
+            content: 'You are a strict JSON API. Only output valid JSON. No Markdown, no explanations.',
           },
           {
             role: 'user',
@@ -204,11 +204,11 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 
 async function callImageEdit(imageDataUrl: string, destination: string): Promise<string> {
   const prompt = `
-这是一张室内平面图。
-请在图上用清晰的红色虚线标注从当前位置（入口附近）到「${destination}」的最佳步行路线。
-路线必须沿走廊和通道行走，不能穿墙。
-在起点标注绿色圆点，终点标注红色圆点。
-保持原始平面图清晰可见。
+This is an indoor floor plan image.
+Draw a clear red dashed line on the image showing the best walking route from the current location (near the entrance) to "${destination}".
+The route must follow corridors and walkways, and must not pass through walls.
+Mark the starting point with a green dot and the destination with a red dot.
+Keep the original floor plan clearly visible.
 `
 
   const response = await fetch(
@@ -322,12 +322,12 @@ function jsonError(c: any, status: number, error: string, message: string) {
 
 app.use('/api/*', async (c, next) => {
   const token = getBearerToken(c.req.header('Authorization'))
-  if (!token) return jsonError(c, 401, 'missing_api_key', '请先设置 API Key。')
+  if (!token) return jsonError(c, 401, 'missing_api_key', 'API Key is not set.')
 
   const keyHash = sha256Hex(token)
   const row = await getApiKey(keyHash)
-  if (!row) return jsonError(c, 401, 'invalid_api_key', 'API Key 无效。')
-  if (row.status !== 'active') return jsonError(c, 403, 'disabled_api_key', 'API Key 已被禁用。')
+  if (!row) return jsonError(c, 401, 'invalid_api_key', 'Invalid API Key.')
+  if (row.status !== 'active') return jsonError(c, 403, 'disabled_api_key', 'API Key is disabled.')
 
   c.set('apiKey', row)
   await next()
@@ -340,7 +340,7 @@ async function chargeAndRun(c: any, endpoint: string, fn: () => Promise<any>) {
 
   if (!deducted) {
     await markFailedNoRefund(generationId, 'insufficient_credits')
-    return jsonError(c, 402, 'insufficient_credits', '额度不足。')
+    return jsonError(c, 402, 'insufficient_credits', 'Insufficient credits.')
   }
 
   try {
@@ -350,7 +350,7 @@ async function chargeAndRun(c: any, endpoint: string, fn: () => Promise<any>) {
   } catch (error: any) {
     console.error('Model request failed:', error?.message || error)
     await markFailedAndRefund(apiKey.id, generationId, error?.message || 'unknown')
-    return jsonError(c, 500, 'model_request_failed', `AI 模型调用失败：${error?.message || 'unknown'}`)
+    return jsonError(c, 500, 'model_request_failed', `Model request failed: ${error?.message || 'unknown'}`)
   }
 }
 
@@ -369,24 +369,24 @@ app.get('/api/credits', async (c) => {
 app.post('/api/corner', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
-    return jsonError(c, 400, 'invalid_request', '请求格式错误：缺少 imageDataUrl。')
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
   }
 
   return chargeAndRun(c, '/api/corner', async () => {
     const result = await callVisionJson(
-      `你是一个文档边角检测器。请找到图片中矩形标牌/平面图的四个角。
-返回归一化坐标（0到1），顺序为左上、右上、右下、左下。
-只输出 JSON：{"corners":[{"x":0.12,"y":0.05},{"x":0.88,"y":0.06},{"x":0.87,"y":0.92},{"x":0.11,"y":0.91}],"message":"已识别平面图边框。"}
-如果无法可靠识别，请仍然返回最接近的四个角。`,
+      `You are a document corner detector. Find the four corners of the rectangular sign/floor plan in the image.
+Return normalized coordinates (0 to 1), in order: top-left, top-right, bottom-right, bottom-left.
+Only output JSON: {"corners":[{"x":0.12,"y":0.05},{"x":0.88,"y":0.06},{"x":0.87,"y":0.92},{"x":0.11,"y":0.91}],"message":"Floor plan border detected."}
+If you cannot reliably detect the corners, still return your best estimate.`,
       body.imageDataUrl
     )
 
     if (!validateCorners(result.corners)) {
-      return { corners: fallbackCorners(), message: '未能准确识别平面图边框，请手动调整四角。' }
+      return { corners: fallbackCorners(), message: 'Could not accurately detect floor plan border. Please adjust corners manually.' }
     }
     return {
       corners: result.corners,
-      message: typeof result.message === 'string' ? result.message : '已识别平面图边框。',
+      message: typeof result.message === 'string' ? result.message : 'Floor plan border detected.',
     }
   })
 })
@@ -394,10 +394,10 @@ app.post('/api/corner', async (c) => {
 app.post('/api/search', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
-    return jsonError(c, 400, 'invalid_request', '请求格式错误：缺少 imageDataUrl。')
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
   }
   if (typeof body.query !== 'string' || body.query.trim() === '') {
-    return jsonError(c, 400, 'invalid_request', '请求格式错误：缺少 query。')
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing query.')
   }
 
   const query = body.query.trim()
@@ -405,16 +405,16 @@ app.post('/api/search', async (c) => {
 
   return chargeAndRun(c, '/api/search', async () => {
     const result = await callVisionJson(
-      `你是室内平面图目的地搜索器。
-用户给你一张已校正的室内平面图和搜索词：「${query}」。
-要求：
-1. 只根据图中可见的文字、房间、设施返回匹配候选。
-2. 不要编造图中看不到的地点。
-3. 最多返回 ${limit} 个。
-4. candidates 按 confidence 由高到低排序。
-5. 只输出 JSON。
-JSON 格式：{"message":"已找到可能匹配的目的地，请选择最准确的一项。","candidates":[{"id":"restroom-east","title":"卫生间","subtitle":"东侧电梯厅旁","confidence":0.92}]}
-如果没有匹配，返回：{"message":"未找到匹配的目的地。","candidates":[]}`,
+      `You are an indoor floor plan destination search engine.
+The user provides a corrected indoor floor plan image and a search query: "${query}".
+Requirements:
+1. Only return matching candidates based on visible text, rooms, and facilities in the image.
+2. Do not fabricate locations not visible in the image.
+3. Return at most ${limit} candidates.
+4. Sort candidates by confidence from high to low.
+5. Only output JSON.
+JSON format: {"message":"Found matching destinations.","candidates":[{"id":"restroom-east","title":"Restroom","subtitle":"Near east elevator","confidence":0.92}]}
+If no match, return: {"message":"No matching destination found.","candidates":[]}`,
       body.imageDataUrl
     )
 
@@ -423,7 +423,7 @@ JSON 格式：{"message":"已找到可能匹配的目的地，请选择最准确
       candidates,
       message: typeof result.message === 'string'
         ? result.message
-        : candidates.length > 0 ? '已找到可能匹配的目的地，请选择最准确的一项。' : '未找到匹配的目的地。',
+        : candidates.length > 0 ? 'Found matching destinations.' : 'No matching destination found.',
     }
   })
 })
@@ -431,17 +431,17 @@ JSON 格式：{"message":"已找到可能匹配的目的地，请选择最准确
 app.post('/api/path', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
-    return jsonError(c, 400, 'invalid_request', '请求格式错误：缺少 imageDataUrl。')
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
   }
   if (typeof body.destination !== 'string' || body.destination.trim() === '') {
-    return jsonError(c, 400, 'invalid_request', '请求格式错误：缺少 destination。')
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing destination.')
   }
 
   const destination = body.destination.trim()
 
   return chargeAndRun(c, '/api/path', async () => {
     const resultImageUrl = await callImageEdit(body.imageDataUrl, destination)
-    return { resultImageUrl, message: '已生成导航路线。' }
+    return { resultImageUrl, message: 'Navigation route generated.' }
   })
 })
 
