@@ -54,6 +54,16 @@ async function initDb() {
       finished_at INTEGER,
       FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
     );
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT PRIMARY KEY,
+      api_key_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+      result_image_url TEXT,
+      error_message TEXT,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+    );
   `)
 }
 
@@ -161,6 +171,7 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
         Authorization: `Bearer ${VISION_MODEL_API_KEY}`,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(120_000),
       body: JSON.stringify({
         model: VISION_MODEL_NAME,
         temperature: 0,
@@ -219,6 +230,7 @@ Keep the original floor plan clearly visible.
         Authorization: `Bearer ${IMAGE_MODEL_API_KEY}`,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(480_000),
       body: JSON.stringify({
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
@@ -357,7 +369,7 @@ async function chargeAndRun(c: any, endpoint: string, fn: () => Promise<any>) {
 app.get('/', (c) => {
   return c.json({
     message: 'FloorRoute API is running.',
-    routes: ['GET /api/credits', 'POST /api/corner', 'POST /api/search', 'POST /api/path'],
+    routes: ['GET /api/credits', 'POST /api/corner', 'POST /api/search', 'POST /api/path', 'GET /api/task/:id'],
   })
 })
 
@@ -374,19 +386,20 @@ app.post('/api/corner', async (c) => {
 
   return chargeAndRun(c, '/api/corner', async () => {
     const result = await callVisionJson(
-      `You are a document corner detector. Find the four corners of the rectangular sign/floor plan in the image.
-Return normalized coordinates (0 to 1), in order: top-left, top-right, bottom-right, bottom-left.
-Only output JSON: {"corners":[{"x":0.12,"y":0.05},{"x":0.88,"y":0.06},{"x":0.87,"y":0.92},{"x":0.11,"y":0.91}],"message":"Floor plan border detected."}
-If you cannot reliably detect the corners, still return your best estimate.`,
+      `You are a floor plan boundary detector. The image shows a photo of an indoor floor plan (possibly mounted on a wall or printed on paper).
+Your task: find the four corners of the FLOOR PLAN DIAGRAM AREA ONLY — the region containing room layouts, corridors, and labels. Do NOT include surrounding elements like title bars, headers, footers, legends, or the physical frame/border of the sign.
+Return normalized coordinates (0 to 1 relative to the full image), in order: top-left, top-right, bottom-right, bottom-left.
+Only output JSON: {"corners":[{"x":0.12,"y":0.15},{"x":0.88,"y":0.15},{"x":0.87,"y":0.85},{"x":0.11,"y":0.84}],"message":"Floor plan area detected."}
+If the floor plan fills the entire image with no surrounding elements, return corners near the image edges.`,
       body.imageDataUrl
     )
 
     if (!validateCorners(result.corners)) {
-      return { corners: fallbackCorners(), message: 'Could not accurately detect floor plan border. Please adjust corners manually.' }
+      return { corners: fallbackCorners(), message: 'Could not accurately detect floor plan area. Please adjust corners manually.' }
     }
     return {
       corners: result.corners,
-      message: typeof result.message === 'string' ? result.message : 'Floor plan border detected.',
+      message: typeof result.message === 'string' ? result.message : 'Floor plan area detected.',
     }
   })
 })
@@ -428,6 +441,8 @@ If no match, return: {"message":"No matching destination found.","candidates":[]
   })
 })
 
+// --- Async path generation ---
+
 app.post('/api/path', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
@@ -437,16 +452,98 @@ app.post('/api/path', async (c) => {
     return jsonError(c, 400, 'invalid_request', 'Invalid request: missing destination.')
   }
 
+  const apiKey = c.get('apiKey') as ApiKeyContext
   const destination = body.destination.trim()
 
-  return chargeAndRun(c, '/api/path', async () => {
-    const resultImageUrl = await callImageEdit(body.imageDataUrl, destination)
-    return { resultImageUrl, message: 'Navigation route generated.' }
+  // Charge credit upfront
+  const generationId = await createGeneration(apiKey.id, '/api/path')
+  const deducted = await deductOneCredit(apiKey.id, generationId)
+  if (!deducted) {
+    await markFailedNoRefund(generationId, 'insufficient_credits')
+    return jsonError(c, 402, 'insufficient_credits', 'Insufficient credits.')
+  }
+
+  // Create task
+  const taskId = newId('task')
+  await db.execute({
+    sql: 'INSERT INTO tasks (id, api_key_id, status, created_at) VALUES (?, ?, \'processing\', ?)',
+    args: [taskId, apiKey.id, nowUnix()],
   })
+
+  // Start background processing (fire and forget)
+  void processPathTask(taskId, apiKey.id, generationId, body.imageDataUrl, destination)
+
+  // Return immediately
+  return c.json({ taskId, message: 'Path generation started.' })
+})
+
+async function processPathTask(
+  taskId: string,
+  apiKeyId: string,
+  generationId: string,
+  imageDataUrl: string,
+  destination: string,
+) {
+  try {
+    const resultImageUrl = await callImageEdit(imageDataUrl, destination)
+    await markSucceeded(generationId)
+    await db.execute({
+      sql: 'UPDATE tasks SET status = \'completed\', result_image_url = ?, finished_at = ? WHERE id = ?',
+      args: [resultImageUrl, nowUnix(), taskId],
+    })
+  } catch (error: any) {
+    const errorMsg = error?.message || 'unknown'
+    console.error('Path generation failed:', errorMsg)
+    await markFailedAndRefund(apiKeyId, generationId, errorMsg)
+    await db.execute({
+      sql: 'UPDATE tasks SET status = \'failed\', error_message = ?, finished_at = ? WHERE id = ?',
+      args: [errorMsg.slice(0, 1000), nowUnix(), taskId],
+    })
+  }
+}
+
+app.get('/api/task/:id', async (c) => {
+  const taskId = c.req.param('id')
+  const apiKey = c.get('apiKey') as ApiKeyContext
+
+  const result = await db.execute({
+    sql: 'SELECT status, result_image_url, error_message FROM tasks WHERE id = ? AND api_key_id = ?',
+    args: [taskId, apiKey.id],
+  })
+
+  const row = result.rows[0]
+  if (!row) {
+    return jsonError(c, 404, 'task_not_found', 'Task not found.')
+  }
+
+  const status = row.status as string
+
+  if (status === 'completed') {
+    return c.json({
+      status: 'completed',
+      resultImageUrl: row.result_image_url as string,
+      message: 'Navigation route generated.',
+    })
+  }
+
+  if (status === 'failed') {
+    return c.json({
+      status: 'failed',
+      message: `Generation failed: ${row.error_message || 'unknown'}`,
+    })
+  }
+
+  return c.json({ status: 'processing', message: 'Generating route...' })
 })
 
 // --- Start server ---
 
 await initDb()
 console.log(`FloorRoute API starting on port ${PORT}`)
-serve({ fetch: app.fetch, port: PORT })
+const server = serve({ fetch: app.fetch, port: PORT })
+;(server as any).requestTimeout = 600_000
+;(server as any).headersTimeout = 600_000
+;(server as any).keepAliveTimeout = 600_000
+server.on('connection', (socket: import('net').Socket) => {
+  socket.setKeepAlive(true, 30_000)
+})
