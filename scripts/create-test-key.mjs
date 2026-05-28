@@ -28,8 +28,8 @@ VALUES
 
 writeFileSync('seed-test-key.sql', sql)
 
-console.log('API Key 明文，只顯示這一次：')
+console.log('API Key (shown only once):')
 console.log(apiKey)
 console.log('')
-console.log('已生成 seed-test-key.sql')
-console.log(`初始額度：${initialCredits}`)
+console.log('Generated seed-test-key.sql')
+console.log(`Initial credits: ${initialCredits}`)
