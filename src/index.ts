@@ -74,8 +74,6 @@ type ApiKeyContext = {
   status: 'active' | 'disabled'
 }
 
-type Corner = { x: number; y: number }
-
 type DestinationCandidate = {
   id: string
   title: string
@@ -109,29 +107,6 @@ function isDataUrl(value: unknown): value is string {
     typeof value === 'string' &&
     /^data:image\/(png|jpeg|jpg|webp);base64,/.test(value)
   )
-}
-
-function validateCorners(corners: any): corners is Corner[] {
-  if (!Array.isArray(corners) || corners.length !== 4) return false
-  return corners.every(
-    (p) =>
-      p &&
-      typeof p.x === 'number' &&
-      typeof p.y === 'number' &&
-      Number.isFinite(p.x) &&
-      Number.isFinite(p.y) &&
-      p.x >= 0 && p.x <= 1 &&
-      p.y >= 0 && p.y <= 1
-  )
-}
-
-function fallbackCorners(): Corner[] {
-  return [
-    { x: 0.05, y: 0.05 },
-    { x: 0.95, y: 0.05 },
-    { x: 0.95, y: 0.95 },
-    { x: 0.05, y: 0.95 },
-  ]
 }
 
 function normalizeLimit(value: unknown): number {
@@ -214,30 +189,38 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 async function callImageEdit(imageDataUrl: string, destination: string): Promise<string> {
-  const prompt = `你正在查看一张室内平面图。你的任务是在图上绘制一条导航路线。
+  const prompt = `你正在查看一张室内平面图。你的任务是在图上绘制一条从当前位置到目的地的导航路线。
 
-第一步 - 分析平面图：
-- 识别所有墙壁（构成房间边界的黑色实线）。
-- 识别走廊和可通行区域（房间之间的空白/灰色开放区域）。
-- 识别门（墙壁上的缺口/开口）。
-- 找到图例（Legend），查看"当前位置"对应的图标/标记样式。
-- 在平面图中找到该标记所在的位置，作为路线起点。
-- 找到目的地："${destination}"。
+## 分析平面图
 
-第二步 - 规划路线：
-- 路线只能经过走廊和门洞。
-- 路线绝对不能穿过任何墙壁（黑色实线）。
-- 利用走廊网络从起点导航到目的地。
-- 选择在可通行区域内的最短路径。
+1. 识别结构元素：
+   - 墙壁：构成房间边界的黑色实线（不可穿越）
+   - 走廊：房间之间的空白/灰色开放通行区域
+   - 门：墙壁上的缺口或开口（可通行）
+2. 定位起点：
+   - 查看图例（Legend）中"当前位置"对应的图标样式（可能是星形、箭头、圆点或人形标记）
+   - 在平面图主体中找到该标记的位置，即为起点
+3. 定位目的地："${destination}"
 
-第三步 - 绘制路线：
-- 沿规划路线画一条粗红色虚线（---）。
-- 线条必须保持在走廊中间，不能接触墙壁。
-- 用绿色圆点标记起点。
-- 用红色圆点标记目的地。
-- 保持原始平面图完全可见，不做任何修改。
+## 规划路线
 
-重要：墙壁是障碍物。路线必须通过走廊绕过房间，绝不能穿过房间。`
+- 路线只能经过走廊和门洞，绝不能穿过墙壁
+- 转弯时沿走廊方向做直角转弯，不要斜穿区域
+- 目的地是房间时，终点设为该房间的门（不进入房间内部）
+- 如果目标房间有多扇门，选择从起点出发路径最短的那扇门作为终点
+- 选择最短的可通行路径
+
+## 绘制路线
+
+- 画一条粗红色虚线（约 4-6px 宽），沿走廊中线绘制
+- 线条与墙壁保持明显间距，不能贴墙
+- 起点标记：绿色实心圆点
+- 终点标记：红色实心圆点
+- 保持原始平面图完全清晰可见，不遮挡任何文字标注
+
+## 关键约束
+
+墙壁是绝对障碍物。即使两点直线距离很近，如果中间有墙，也必须绕行走廊。绝不能穿过房间内部。`
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -395,32 +378,6 @@ app.get('/api/credits', async (c) => {
   return c.json({ balance: await getBalance(apiKey.id) })
 })
 
-app.post('/api/corner', async (c) => {
-  const body = await c.req.json().catch(() => null)
-  if (!body || !isDataUrl(body.imageDataUrl)) {
-    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
-  }
-
-  return chargeAndRun(c, '/api/corner', async () => {
-    const result = await callVisionJson(
-      `You are a floor plan boundary detector. The image shows a photo of an indoor floor plan (possibly mounted on a wall or printed on paper).
-Your task: find the four corners of the FLOOR PLAN DIAGRAM AREA ONLY — the region containing room layouts, corridors, and labels. Do NOT include surrounding elements like title bars, headers, footers, legends, or the physical frame/border of the sign.
-Return normalized coordinates (0 to 1 relative to the full image), in order: top-left, top-right, bottom-right, bottom-left.
-Only output JSON: {"corners":[{"x":0.12,"y":0.15},{"x":0.88,"y":0.15},{"x":0.87,"y":0.85},{"x":0.11,"y":0.84}],"message":"Floor plan area detected."}
-If the floor plan fills the entire image with no surrounding elements, return corners near the image edges.`,
-      body.imageDataUrl
-    )
-
-    if (!validateCorners(result.corners)) {
-      return { corners: fallbackCorners(), message: 'Could not accurately detect floor plan area. Please adjust corners manually.' }
-    }
-    return {
-      corners: result.corners,
-      message: typeof result.message === 'string' ? result.message : 'Floor plan area detected.',
-    }
-  })
-})
-
 app.post('/api/search', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
@@ -435,16 +392,21 @@ app.post('/api/search', async (c) => {
 
   return chargeAndRun(c, '/api/search', async () => {
     const result = await callVisionJson(
-      `You are an indoor floor plan destination search engine.
-The user provides a corrected indoor floor plan image and a search query: "${query}".
-Requirements:
-1. Only return matching candidates based on visible text, rooms, and facilities in the image.
-2. Do not fabricate locations not visible in the image.
-3. Return at most ${limit} candidates.
-4. Sort candidates by confidence from high to low.
-5. Only output JSON.
-JSON format: {"message":"Found matching destinations.","candidates":[{"id":"restroom-east","title":"Restroom","subtitle":"Near east elevator","confidence":0.92}]}
-If no match, return: {"message":"No matching destination found.","candidates":[]}`,
+      `你是一个室内平面图目的地搜索引擎。
+
+用户提供一张室内平面图和搜索词："${query}"。
+
+搜索规则：
+1. 仅根据图中可见的文字、房间名称、设施标注进行匹配。
+2. 支持同义词和模糊匹配（如"厕所"匹配"卫生间"/"洗手间"/"WC"，"电梯"匹配"升降机"/"Elevator"）。
+3. 绝不编造图中不存在的地点。
+4. 最多返回 ${limit} 个候选结果，按匹配置信度从高到低排序。
+5. id 使用英文小写加连字符，基于位置特征生成（如 "restroom-east"、"elevator-b1"）。
+6. subtitle 填写该地点在图中的相对位置描述（如"东侧电梯旁"、"A区走廊尽头"）。
+
+输出格式（仅输出 JSON）：
+{"message":"找到匹配的目的地。","candidates":[{"id":"restroom-east","title":"卫生间","subtitle":"东侧电梯旁","confidence":0.92}]}
+无匹配时返回：{"message":"未找到匹配的目的地。","candidates":[]}`,
       body.imageDataUrl
     )
 
