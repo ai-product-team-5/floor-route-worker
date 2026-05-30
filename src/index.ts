@@ -192,37 +192,40 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 /**
- * 从 data URL 解析图片宽高，选择最接近原图比例的 aspect_ratio。
- * OpenRouter image_config 支持: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3
+ * 从支持的预设尺寸中选择最接近输入宽高比的尺寸。
+ * 优先匹配宽高比，其次选面积最接近的。
  */
-function pickAspectRatio(imageDataUrl: string): string {
-  const dimensions = parseImageDimensions(imageDataUrl)
-  if (!dimensions) return '1:1'
+function pickClosestSize(inputW: number, inputH: number): string {
+  const inputRatio = inputW / inputH
+  const inputArea = inputW * inputH
 
-  const { width, height } = dimensions
-  const ratio = width / height
-
-  // Match to closest supported aspect ratio
-  const options: [number, string][] = [
-    [1, '1:1'],
-    [16 / 9, '16:9'],
-    [9 / 16, '9:16'],
-    [4 / 3, '4:3'],
-    [3 / 4, '3:4'],
-    [3 / 2, '3:2'],
-    [2 / 3, '2:3'],
+  // OpenRouter 支持的预设尺寸（竖向为主，适合平面图）
+  const sizes: [number, number][] = [
+    [1080, 1080],
+    [1080, 1440],
+    [1080, 1620],
+    [1080, 1920],
+    [720, 960],
+    [720, 1080],
+    [720, 1280],
+    [480, 640],
+    [480, 720],
   ]
 
-  let best = '1:1'
-  let bestDiff = Infinity
-  for (const [r, label] of options) {
-    const diff = Math.abs(ratio - r)
-    if (diff < bestDiff) {
-      bestDiff = diff
-      best = label
+  let best = '1080x1080'
+  let bestScore = Infinity
+  for (const [w, h] of sizes) {
+    const ratio = w / h
+    const area = w * h
+    // 宽高比差异权重高，面积差异权重低
+    const ratioDiff = Math.abs(ratio - inputRatio) * 10
+    const areaDiff = Math.abs(area - inputArea) / inputArea
+    const score = ratioDiff + areaDiff
+    if (score < bestScore) {
+      bestScore = score
+      best = `${w}x${h}`
     }
   }
-  console.log(`Image dimensions: ${width}x${height}, ratio: ${ratio.toFixed(3)}, selected aspect_ratio: ${best}`)
   return best
 }
 
@@ -275,12 +278,13 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
 只输出图像，不要附带任何文字说明。`
 
-  // 从 data URL 解析图片尺寸，用 size 字段尝试精确匹配输出尺寸
+  // 从 data URL 解析图片尺寸，选择最接近的支持尺寸
   const dimensions = parseImageDimensions(imageDataUrl)
   if (!dimensions) {
     throw new Error('无法解析输入图片尺寸')
   }
-  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}`)
+  const size = pickClosestSize(dimensions.width, dimensions.height)
+  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}, selected size: ${size}`)
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -295,7 +299,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
         image_config: {
-          size: `${dimensions.width}x${dimensions.height}`,
+          size,
         },
         messages: [
           {
