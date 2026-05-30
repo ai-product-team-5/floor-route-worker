@@ -192,38 +192,28 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 /**
- * 从支持的预设尺寸中选择最接近输入宽高比的尺寸。
- * 优先匹配宽高比，其次选面积最接近的。
+ * 选择最接近输入宽高比的 aspect_ratio。
+ * OpenRouter image_config 支持: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3
  */
-function pickClosestSize(inputW: number, inputH: number): string {
-  const inputRatio = inputW / inputH
-  const inputArea = inputW * inputH
-
-  // OpenRouter 支持的预设尺寸（竖向为主，适合平面图）
-  const sizes: [number, number][] = [
-    [1080, 1080],
-    [1080, 1440],
-    [1080, 1620],
-    [1080, 1920],
-    [720, 960],
-    [720, 1080],
-    [720, 1280],
-    [480, 640],
-    [480, 720],
+function pickClosestAspectRatio(inputW: number, inputH: number): string {
+  const ratio = inputW / inputH
+  const options: [number, string][] = [
+    [1, '1:1'],
+    [16 / 9, '16:9'],
+    [9 / 16, '9:16'],
+    [4 / 3, '4:3'],
+    [3 / 4, '3:4'],
+    [3 / 2, '3:2'],
+    [2 / 3, '2:3'],
   ]
 
-  let best = '1080x1080'
-  let bestScore = Infinity
-  for (const [w, h] of sizes) {
-    const ratio = w / h
-    const area = w * h
-    // 宽高比差异权重高，面积差异权重低
-    const ratioDiff = Math.abs(ratio - inputRatio) * 10
-    const areaDiff = Math.abs(area - inputArea) / inputArea
-    const score = ratioDiff + areaDiff
-    if (score < bestScore) {
-      bestScore = score
-      best = `${w}x${h}`
+  let best = '1:1'
+  let bestDiff = Infinity
+  for (const [r, label] of options) {
+    const diff = Math.abs(ratio - r)
+    if (diff < bestDiff) {
+      bestDiff = diff
+      best = label
     }
   }
   return best
@@ -278,13 +268,13 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
 只输出图像，不要附带任何文字说明。`
 
-  // 从 data URL 解析图片尺寸，选择最接近的支持尺寸
+  // 从 data URL 解析图片尺寸，选择最接近的 aspect_ratio
   const dimensions = parseImageDimensions(imageDataUrl)
   if (!dimensions) {
     throw new Error('无法解析输入图片尺寸')
   }
-  const size = pickClosestSize(dimensions.width, dimensions.height)
-  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}, selected size: ${size}`)
+  const aspectRatio = pickClosestAspectRatio(dimensions.width, dimensions.height)
+  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}, selected aspect_ratio: ${aspectRatio}`)
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -299,7 +289,8 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
         image_config: {
-          size,
+          aspect_ratio: aspectRatio,
+          image_size: '2K',
         },
         messages: [
           {
