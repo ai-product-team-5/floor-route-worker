@@ -135,6 +135,8 @@ function validateCandidates(value: any, limit: number): DestinationCandidate[] {
     }))
 }
 
+
+
 // --- Model calls ---
 
 async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any> {
@@ -188,39 +190,29 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
   }
 }
 
-async function callImageEdit(imageDataUrl: string, destination: string): Promise<string> {
-  const prompt = `你正在查看一张室内平面图。你的任务是在图上绘制一条从当前位置到目的地的导航路线。
+async function callImageWallMask(imageDataUrl: string): Promise<string> {
+  const prompt = `你正在分析一张室内平面图。你的任务是输出一张**纯黑白二值化的墙体掩码图**，用于后续算法寻路。
 
-## 分析平面图
+## 输出要求
 
-1. 识别结构元素：
-   - 墙壁：构成房间边界的黑色实线（不可穿越）
-   - 走廊：房间之间的空白/灰色开放通行区域
-   - 门：墙壁上的缺口或开口（可通行）
-2. 定位起点：
-   - 查看图例（Legend）中"当前位置"对应的图标样式（可能是星形、箭头、圆点或人形标记）
-   - 在平面图主体中找到该标记的位置，即为起点
-3. 定位目的地："${destination}"
-
-## 规划路线
-
-- 路线只能经过走廊和门洞，绝不能穿过墙壁
-- 转弯时沿走廊方向做直角转弯，不要斜穿区域
-- 目的地是房间时，终点设为该房间的门（不进入房间内部）
-- 如果目标房间有多扇门，选择从起点出发路径最短的那扇门作为终点
-- 选择最短的可通行路径
-
-## 绘制路线
-
-- 画一条粗红色虚线（约 4-6px 宽），沿走廊中线绘制
-- 线条与墙壁保持明显间距，不能贴墙
-- 起点标记：绿色实心圆点
-- 终点标记：红色实心圆点
-- 保持原始平面图完全清晰可见，不遮挡任何文字标注
+- 输出尺寸：与输入图保持同样的宽高比，不要旋转、裁剪或加边
+- 仅使用两种颜色：纯黑 (#000000) 和 纯白 (#FFFFFF)，禁止任何灰色/抗锯齿/中间色
+- **墙壁 = 黑色**：所有不可通行的实体墙线
+- **可通行区域 = 白色**：走廊、房间内部、门洞、室外
+- 门洞必须保留为白色（让走廊与房间在掩码上保持连通）
+- 删除所有文字、数字、房间标签、图例、家具、装饰图标、指北针、比例尺
+- 删除所有"当前位置"标记和图例图标
+- 不要画任何路径、箭头、起点终点
+- 不要保留原图的颜色、底纹、阴影
 
 ## 关键约束
 
-墙壁是绝对障碍物。即使两点直线距离很近，如果中间有墙，也必须绕行走廊。绝不能穿过房间内部。`
+最终图必须是干净的二值墙体平面图，使得：
+1. 沿任何走廊放一个像素，都能通过白色像素连通到任意房间门口
+2. 房间之间通过门洞而不是墙壁连接
+3. 黑色墙线尽量保持原图墙体的真实粗细和位置
+
+只输出图像，不要附带任何文字说明。`
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -369,7 +361,13 @@ async function chargeAndRun(c: any, endpoint: string, fn: () => Promise<any>) {
 app.get('/', (c) => {
   return c.json({
     message: 'FloorRoute API is running.',
-    routes: ['GET /api/credits', 'POST /api/corner', 'POST /api/search', 'POST /api/path', 'GET /api/task/:id'],
+    routes: [
+      'GET /api/credits',
+      'POST /api/search',
+      'POST /api/walls',
+      'POST /api/endpoints',
+      'GET /api/task/:id',
+    ],
   })
 })
 
@@ -420,22 +418,18 @@ app.post('/api/search', async (c) => {
   })
 })
 
-// --- Async path generation ---
+// --- Async wall mask generation ---
 
-app.post('/api/path', async (c) => {
+app.post('/api/walls', async (c) => {
   const body = await c.req.json().catch(() => null)
   if (!body || !isDataUrl(body.imageDataUrl)) {
     return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
   }
-  if (typeof body.destination !== 'string' || body.destination.trim() === '') {
-    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing destination.')
-  }
 
   const apiKey = c.get('apiKey') as ApiKeyContext
-  const destination = body.destination.trim()
 
   // Charge credit upfront
-  const generationId = await createGeneration(apiKey.id, '/api/path')
+  const generationId = await createGeneration(apiKey.id, '/api/walls')
   const deducted = await deductOneCredit(apiKey.id, generationId)
   if (!deducted) {
     await markFailedNoRefund(generationId, 'insufficient_credits')
@@ -450,29 +444,28 @@ app.post('/api/path', async (c) => {
   })
 
   // Start background processing (fire and forget)
-  void processPathTask(taskId, apiKey.id, generationId, body.imageDataUrl, destination)
+  void processWallsTask(taskId, apiKey.id, generationId, body.imageDataUrl)
 
   // Return immediately
-  return c.json({ taskId, message: 'Path generation started.' })
+  return c.json({ taskId, message: 'Wall mask generation started.' })
 })
 
-async function processPathTask(
+async function processWallsTask(
   taskId: string,
   apiKeyId: string,
   generationId: string,
   imageDataUrl: string,
-  destination: string,
 ) {
   try {
-    const resultImageUrl = await callImageEdit(imageDataUrl, destination)
+    const wallMaskDataUrl = await callImageWallMask(imageDataUrl)
     await markSucceeded(generationId)
     await db.execute({
       sql: 'UPDATE tasks SET status = \'completed\', result_image_url = ?, finished_at = ? WHERE id = ?',
-      args: [resultImageUrl, nowUnix(), taskId],
+      args: [wallMaskDataUrl, nowUnix(), taskId],
     })
   } catch (error: any) {
     const errorMsg = error?.message || 'unknown'
-    console.error('Path generation failed:', errorMsg)
+    console.error('Wall mask generation failed:', errorMsg)
     await markFailedAndRefund(apiKeyId, generationId, errorMsg)
     await db.execute({
       sql: 'UPDATE tasks SET status = \'failed\', error_message = ?, finished_at = ? WHERE id = ?',
@@ -500,8 +493,8 @@ app.get('/api/task/:id', async (c) => {
   if (status === 'completed') {
     return c.json({
       status: 'completed',
-      resultImageUrl: row.result_image_url as string,
-      message: 'Navigation route generated.',
+      wallMaskDataUrl: row.result_image_url as string,
+      message: 'Wall mask generated.',
     })
   }
 
@@ -512,8 +505,194 @@ app.get('/api/task/:id', async (c) => {
     })
   }
 
-  return c.json({ status: 'processing', message: 'Generating route...' })
+  return c.json({ status: 'processing', message: 'Generating wall mask...' })
 })
+
+// --- Sync endpoints (start/end) detection ---
+
+app.post('/api/endpoints', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (!body || !isDataUrl(body.imageDataUrl)) {
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
+  }
+  if (typeof body.destination !== 'string' || body.destination.trim() === '') {
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing destination.')
+  }
+
+  const destination = body.destination.trim()
+
+  return chargeAndRun(c, '/api/endpoints', async () => {
+    // 使用 Qwen3-VL 原生 grounding 格式（point_2d，坐标范围 0~1000）
+    const prompt = `Locate the following two points in this indoor floor plan image. Report point coordinates in JSON format.
+
+1. "current_position": The "current location" marker on the map. First check the legend/key area to identify what icon style represents "current position" (could be a star ★, arrow ➤, person icon, colored dot, etc.), then find that same icon in the main map area. The point should be at the center of that marker.
+
+2. "destination_door_${destination}": The door/entrance of the room or facility labeled "${destination}" (or the closest match). The point should be at the doorway closest to the main corridor, NOT the center of the room.
+
+Output format: JSON array with point_2d coordinates (0-1000 range) and labels. Example:
+[{"point_2d": [420, 310], "label": "current_position"}, {"point_2d": [780, 550], "label": "destination_door"}]
+
+If you cannot reliably locate a point, still include it but add "confidence": 0. Otherwise add "confidence" between 0.5 and 1.0 reflecting your certainty.`
+
+    const rawText = await callVisionRaw(prompt, body.imageDataUrl)
+    const parsed = parseGroundingResponse(rawText)
+
+    return {
+      start: parsed.start,
+      end: parsed.end,
+      message: parsed.message,
+    }
+  })
+})
+
+/**
+ * 调用视觉模型并返回原始文本（不做 JSON parse）。
+ * 用于 grounding 格式，模型可能返回 markdown code block 包裹的 JSON。
+ */
+async function callVisionRaw(prompt: string, imageDataUrl: string): Promise<string> {
+  const response = await fetch(
+    `${VISION_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${VISION_MODEL_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(60_000),
+      body: JSON.stringify({
+        model: VISION_MODEL_NAME,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: imageDataUrl } },
+            ],
+          },
+        ],
+        max_tokens: 1000,
+        temperature: 0.1,
+      }),
+    }
+  )
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`Vision model failed: ${response.status} ${text.slice(0, 200)}`)
+  }
+
+  const data: any = await response.json()
+  const content = data?.choices?.[0]?.message?.content
+  if (!content || typeof content !== 'string') {
+    throw new Error('Vision model returned empty response')
+  }
+  return content
+}
+
+type EndpointResult = {
+  start: { x: number; y: number; confidence: number }
+  end: { x: number; y: number; confidence: number }
+  message: string
+}
+
+/**
+ * 解析 Qwen3-VL grounding 格式的响应。
+ * 模型输出 JSON 数组：[{"point_2d": [x, y], "label": "...", "confidence": 0.9}, ...]
+ * 坐标范围 0~1000，需要除以 1000 转为归一化 [0, 1]。
+ */
+function parseGroundingResponse(rawText: string): EndpointResult {
+  // 提取 JSON（可能被 markdown code block 包裹）
+  let jsonStr = rawText.trim()
+  const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (codeBlockMatch) {
+    jsonStr = codeBlockMatch[1].trim()
+  }
+
+  let points: any[]
+  try {
+    const parsed = JSON.parse(jsonStr)
+    points = Array.isArray(parsed) ? parsed : []
+  } catch {
+    // 尝试从文本中提取 JSON 数组
+    const arrayMatch = rawText.match(/\[[\s\S]*\]/)
+    if (arrayMatch) {
+      try {
+        points = JSON.parse(arrayMatch[0])
+      } catch {
+        return fallbackResult('无法解析模型返回的坐标数据')
+      }
+    } else {
+      return fallbackResult('模型未返回有效的坐标数据')
+    }
+  }
+
+  if (!Array.isArray(points) || points.length === 0) {
+    return fallbackResult('模型未返回有效的坐标点')
+  }
+
+  // 找 start（current_position）和 end（destination_door）
+  let startItem: any = null
+  let endItem: any = null
+
+  for (const item of points) {
+    if (!item || !Array.isArray(item.point_2d) || item.point_2d.length < 2) continue
+    const label = String(item.label || '').toLowerCase()
+    if (label.includes('current') || label.includes('start') || label.includes('位置')) {
+      startItem = item
+    } else if (label.includes('destination') || label.includes('door') || label.includes('end')) {
+      endItem = item
+    }
+  }
+
+  // 如果只有两个点且没匹配到 label，按顺序取
+  if (!startItem && !endItem && points.length >= 2) {
+    if (points[0]?.point_2d && points[1]?.point_2d) {
+      startItem = points[0]
+      endItem = points[1]
+    }
+  }
+
+  const start = pointFromGrounding(startItem)
+  const end = pointFromGrounding(endItem)
+
+  const lowConfidence = start.confidence < 0.3 || end.confidence < 0.3
+  const message = lowConfidence
+    ? '部分坐标置信度较低，路径可能不准确。'
+    : '已定位起点和终点。'
+
+  return { start, end, message }
+}
+
+function pointFromGrounding(item: any): { x: number; y: number; confidence: number } {
+  if (!item || !Array.isArray(item.point_2d) || item.point_2d.length < 2) {
+    return { x: 0, y: 0, confidence: 0 }
+  }
+
+  const rawX = Number(item.point_2d[0])
+  const rawY = Number(item.point_2d[1])
+
+  if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+    return { x: 0, y: 0, confidence: 0 }
+  }
+
+  // Qwen3-VL grounding 坐标范围 0~1000，转为归一化 [0, 1]
+  const x = Math.min(1, Math.max(0, rawX / 1000))
+  const y = Math.min(1, Math.max(0, rawY / 1000))
+
+  const confidence = typeof item.confidence === 'number' && Number.isFinite(item.confidence)
+    ? Math.min(1, Math.max(0, item.confidence))
+    : 0.7 // grounding 模式下模型不一定输出 confidence，默认给 0.7
+
+  return { x, y, confidence }
+}
+
+function fallbackResult(message: string): EndpointResult {
+  return {
+    start: { x: 0, y: 0, confidence: 0 },
+    end: { x: 0, y: 0, confidence: 0 },
+    message,
+  }
+}
 
 // --- Start server ---
 

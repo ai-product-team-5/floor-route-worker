@@ -7,9 +7,10 @@
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/credits` | 查询剩余算力 |
-| POST | `/api/corner` | 检测平面图四角坐标 |
-| POST | `/api/search` | 搜索目的地候选 |
-| POST | `/api/path` | 生成导航路线图 |
+| POST | `/api/search` | 在校正后的平面图上搜索目的地候选 |
+| POST | `/api/walls` | 异步生成墙体二值掩码（用于前端寻路） |
+| POST | `/api/endpoints` | 在平面图上定位起点和终点的归一化坐标 |
+| GET | `/api/task/:id` | 查询异步任务状态（墙体掩码） |
 
 所有 `/api/*` 请求需要 `Authorization: Bearer fr_live_xxx` header。
 
