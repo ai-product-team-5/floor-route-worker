@@ -4,6 +4,7 @@ import { cors } from 'hono/cors'
 import { createClient } from '@libsql/client'
 import { createHash, randomUUID } from 'node:crypto'
 import { imageSize } from 'image-size'
+import sharp from 'sharp'
 
 // --- Config from environment variables ---
 
@@ -276,6 +277,42 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
   const aspectRatio = pickClosestAspectRatio(dimensions.width, dimensions.height)
   console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}, selected aspect_ratio: ${aspectRatio}`)
 
+  // 把输入图 pad 到目标 aspect ratio（白色填充），保证输入输出同比例
+  const [arW, arH] = aspectRatio.split(':').map(Number)
+  const targetRatio = arW / arH
+  const inputRatio = dimensions.width / dimensions.height
+  let padLeft = 0, padTop = 0, paddedW = dimensions.width, paddedH = dimensions.height
+
+  if (inputRatio < targetRatio) {
+    // 需要加宽
+    paddedW = Math.round(dimensions.height * targetRatio)
+    padLeft = Math.round((paddedW - dimensions.width) / 2)
+  } else if (inputRatio > targetRatio) {
+    // 需要加高
+    paddedH = Math.round(dimensions.width / targetRatio)
+    padTop = Math.round((paddedH - dimensions.height) / 2)
+  }
+
+  let inputToSend = imageDataUrl
+  if (padLeft > 0 || padTop > 0) {
+    const base64Match = imageDataUrl.match(/^data:image\/([^;]+);base64,(.+)$/)
+    if (base64Match) {
+      const inputBuf = Buffer.from(base64Match[2], 'base64')
+      const paddedBuf = await sharp(inputBuf)
+        .extend({
+          top: padTop,
+          bottom: paddedH - dimensions.height - padTop,
+          left: padLeft,
+          right: paddedW - dimensions.width - padLeft,
+          background: { r: 255, g: 255, b: 255, alpha: 1 },
+        })
+        .png()
+        .toBuffer()
+      inputToSend = `data:image/png;base64,${paddedBuf.toString('base64')}`
+      console.log(`Padded to ${paddedW}x${paddedH} (pad left=${padLeft}, top=${padTop})`)
+    }
+  }
+
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
     {
@@ -297,7 +334,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
             role: 'user',
             content: [
               { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: imageDataUrl } },
+              { type: 'image_url', image_url: { url: inputToSend } },
             ],
           },
         ],
@@ -313,20 +350,50 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
   const data: any = await response.json()
   const message = data.choices?.[0]?.message
 
+  let outputDataUrl: string | null = null
   const imageUrl = message?.images?.[0]?.image_url?.url
   if (typeof imageUrl === 'string' && imageUrl.startsWith('data:')) {
-    return imageUrl
+    outputDataUrl = imageUrl
   }
-
-  if (Array.isArray(message?.content)) {
+  if (!outputDataUrl && Array.isArray(message?.content)) {
     for (const part of message.content) {
       if (part.type === 'image_url' && part.image_url?.url?.startsWith('data:')) {
-        return part.image_url.url
+        outputDataUrl = part.image_url.url
+        break
       }
     }
   }
+  if (!outputDataUrl) {
+    throw new Error('Image model did not return a generated image')
+  }
 
-  throw new Error('Image model did not return a generated image')
+  // 如果做了 pad，需要 crop 回原始比例
+  if (padLeft > 0 || padTop > 0) {
+    const outMatch = outputDataUrl.match(/^data:image\/([^;]+);base64,(.+)$/)
+    if (outMatch) {
+      const outBuf = Buffer.from(outMatch[2], 'base64')
+      const outMeta = await sharp(outBuf).metadata()
+      const outW = outMeta.width!
+      const outH = outMeta.height!
+
+      // 按比例计算 crop 区域
+      const scaleX = outW / paddedW
+      const scaleY = outH / paddedH
+      const cropLeft = Math.round(padLeft * scaleX)
+      const cropTop = Math.round(padTop * scaleY)
+      const cropW = Math.round(dimensions.width * scaleX)
+      const cropH = Math.round(dimensions.height * scaleY)
+
+      console.log(`Cropping output ${outW}x${outH} -> ${cropW}x${cropH} (left=${cropLeft}, top=${cropTop})`)
+      const croppedBuf = await sharp(outBuf)
+        .extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
+        .png()
+        .toBuffer()
+      outputDataUrl = `data:image/png;base64,${croppedBuf.toString('base64')}`
+    }
+  }
+
+  return outputDataUrl
 }
 
 // --- Database operations ---
