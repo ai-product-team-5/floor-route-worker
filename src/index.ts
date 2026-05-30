@@ -192,23 +192,38 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
 }
 
 /**
- * 从 data URL 解析图片宽高，选择最接近原图比例的 gpt-image-2 支持尺寸。
- * 支持的尺寸：1024x1024, 1536x1024 (landscape), 1024x1536 (portrait)
- * auto 让模型自动选择（如果 API 支持）。
+ * 从 data URL 解析图片宽高，选择最接近原图比例的 aspect_ratio。
+ * OpenRouter image_config 支持: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3
  */
-async function pickOutputSize(imageDataUrl: string): Promise<string> {
+function pickAspectRatio(imageDataUrl: string): string {
   const dimensions = parseImageDimensions(imageDataUrl)
-  if (!dimensions) return 'auto'
+  if (!dimensions) return '1:1'
 
   const { width, height } = dimensions
   const ratio = width / height
 
-  // landscape: ratio > 1.2 → 1536x1024
-  // portrait: ratio < 0.83 → 1024x1536
-  // otherwise square: 1024x1024
-  if (ratio > 1.2) return '1536x1024'
-  if (ratio < 0.83) return '1024x1536'
-  return '1024x1024'
+  // Match to closest supported aspect ratio
+  const options: [number, string][] = [
+    [1, '1:1'],
+    [16 / 9, '16:9'],
+    [9 / 16, '9:16'],
+    [4 / 3, '4:3'],
+    [3 / 4, '3:4'],
+    [3 / 2, '3:2'],
+    [2 / 3, '2:3'],
+  ]
+
+  let best = '1:1'
+  let bestDiff = Infinity
+  for (const [r, label] of options) {
+    const diff = Math.abs(ratio - r)
+    if (diff < bestDiff) {
+      bestDiff = diff
+      best = label
+    }
+  }
+  console.log(`Image dimensions: ${width}x${height}, ratio: ${ratio.toFixed(3)}, selected aspect_ratio: ${best}`)
+  return best
 }
 
 /**
@@ -260,8 +275,8 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
 只输出图像，不要附带任何文字说明。`
 
-  // 从 data URL 解析图片尺寸，选择最接近的 gpt-image-2 支持的 size
-  const outputSize = await pickOutputSize(imageDataUrl)
+  // 从 data URL 解析图片尺寸，选择最接近的 aspect_ratio
+  const aspectRatio = pickAspectRatio(imageDataUrl)
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -275,7 +290,10 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
       body: JSON.stringify({
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
-        size: outputSize,
+        image_config: {
+          aspect_ratio: aspectRatio,
+          image_size: '2K',
+        },
         messages: [
           {
             role: 'user',
