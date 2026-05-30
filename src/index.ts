@@ -275,8 +275,12 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
 只输出图像，不要附带任何文字说明。`
 
-  // 从 data URL 解析图片尺寸，选择最接近的 aspect_ratio
-  const aspectRatio = pickAspectRatio(imageDataUrl)
+  // 从 data URL 解析图片尺寸，用 size 字段尝试精确匹配输出尺寸
+  const dimensions = parseImageDimensions(imageDataUrl)
+  if (!dimensions) {
+    throw new Error('无法解析输入图片尺寸')
+  }
+  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}`)
 
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
@@ -291,8 +295,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
         image_config: {
-          aspect_ratio: aspectRatio,
-          image_size: '2K',
+          size: `${dimensions.width}x${dimensions.height}`,
         },
         messages: [
           {
