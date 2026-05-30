@@ -190,6 +190,63 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
   }
 }
 
+/**
+ * 从 data URL 解析图片宽高，选择最接近原图比例的 gpt-image-2 支持尺寸。
+ * 支持的尺寸：1024x1024, 1536x1024 (landscape), 1024x1536 (portrait)
+ * auto 让模型自动选择（如果 API 支持）。
+ */
+async function pickOutputSize(imageDataUrl: string): Promise<string> {
+  const dimensions = parseImageDimensions(imageDataUrl)
+  if (!dimensions) return 'auto'
+
+  const { width, height } = dimensions
+  const ratio = width / height
+
+  // landscape: ratio > 1.2 → 1536x1024
+  // portrait: ratio < 0.83 → 1024x1536
+  // otherwise square: 1024x1024
+  if (ratio > 1.2) return '1536x1024'
+  if (ratio < 0.83) return '1024x1536'
+  return '1024x1024'
+}
+
+/**
+ * 尝试从 JPEG/PNG data URL 的二进制头中解析图片尺寸（不需要 canvas/sharp）。
+ */
+function parseImageDimensions(dataUrl: string): { width: number; height: number } | null {
+  try {
+    const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+    if (!base64Match) return null
+    const buf = Buffer.from(base64Match[1], 'base64')
+
+    // PNG: width at bytes 16-19, height at bytes 20-23 (big-endian)
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      const width = buf.readUInt32BE(16)
+      const height = buf.readUInt32BE(20)
+      return { width, height }
+    }
+
+    // JPEG: scan for SOF0/SOF2 marker (0xFF 0xC0 or 0xFF 0xC2)
+    let i = 2
+    while (i < buf.length - 9) {
+      if (buf[i] !== 0xff) { i++; continue }
+      const marker = buf[i + 1]
+      if (marker === 0xc0 || marker === 0xc2) {
+        const height = buf.readUInt16BE(i + 5)
+        const width = buf.readUInt16BE(i + 7)
+        return { width, height }
+      }
+      // Skip to next marker
+      const segLen = buf.readUInt16BE(i + 2)
+      i += 2 + segLen
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
+
 async function callImageWallMask(imageDataUrl: string): Promise<string> {
   const prompt = `你正在分析一张室内平面图。你的任务是输出一张**纯黑白二值化的墙体掩码图**，用于后续算法寻路。
 
@@ -221,6 +278,9 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
 只输出图像，不要附带任何文字说明。`
 
+  // 从 data URL 解析图片尺寸，选择最接近的 gpt-image-2 支持的 size
+  const outputSize = await pickOutputSize(imageDataUrl)
+
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
     {
@@ -233,6 +293,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
       body: JSON.stringify({
         model: IMAGE_MODEL_NAME,
         modalities: ['image', 'text'],
+        size: outputSize,
         messages: [
           {
             role: 'user',
