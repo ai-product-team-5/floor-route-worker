@@ -10,7 +10,8 @@
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "@libsql/client": "^0.14.0",
-    "hono": "^4.12.23"
+    "hono": "^4.12.23",
+    "image-size": "^2.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

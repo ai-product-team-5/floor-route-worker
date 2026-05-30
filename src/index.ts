@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { createClient } from '@libsql/client'
 import { createHash, randomUUID } from 'node:crypto'
+import { imageSize } from 'image-size'
 
 // --- Config from environment variables ---
 
@@ -211,36 +212,17 @@ async function pickOutputSize(imageDataUrl: string): Promise<string> {
 }
 
 /**
- * 尝试从 JPEG/PNG data URL 的二进制头中解析图片尺寸（不需要 canvas/sharp）。
+ * 从 data URL 解析图片宽高，使用 image-size 库正确处理各种 JPEG/PNG 格式。
  */
 function parseImageDimensions(dataUrl: string): { width: number; height: number } | null {
   try {
     const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
     if (!base64Match) return null
     const buf = Buffer.from(base64Match[1], 'base64')
-
-    // PNG: width at bytes 16-19, height at bytes 20-23 (big-endian)
-    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
-      const width = buf.readUInt32BE(16)
-      const height = buf.readUInt32BE(20)
-      return { width, height }
+    const result = imageSize(buf)
+    if (result.width && result.height) {
+      return { width: result.width, height: result.height }
     }
-
-    // JPEG: scan for SOF0/SOF2 marker (0xFF 0xC0 or 0xFF 0xC2)
-    let i = 2
-    while (i < buf.length - 9) {
-      if (buf[i] !== 0xff) { i++; continue }
-      const marker = buf[i + 1]
-      if (marker === 0xc0 || marker === 0xc2) {
-        const height = buf.readUInt16BE(i + 5)
-        const width = buf.readUInt16BE(i + 7)
-        return { width, height }
-      }
-      // Skip to next marker
-      const segLen = buf.readUInt16BE(i + 2)
-      i += 2 + segLen
-    }
-
     return null
   } catch {
     return null
