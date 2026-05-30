@@ -525,7 +525,7 @@ app.post('/api/endpoints', async (c) => {
     // 使用 Qwen3-VL 原生 grounding 格式（point_2d，坐标范围 0~1000）
     const prompt = `Locate the following two points in this indoor floor plan image. Report point coordinates in JSON format.
 
-1. "current_position": The "current location" marker on the map. First check the legend/key area to identify what icon style represents "current position" (could be a star ★, arrow ➤, person icon, colored dot, etc.), then find that same icon in the main map area. The point should be at the center of that marker.
+1. "current_position": Find the "You Are Here" / "当前位置" / "Current Location" marker WITHIN THE MAP AREA itself (NOT in the legend/key). This is typically a distinctive icon (colored dot, star ★, arrow ➤, person icon, or pin) placed on a corridor or room in the main floor plan drawing to show where the viewer is standing. IMPORTANT: Do NOT return coordinates of the legend/key area at the bottom or side of the image — only the actual marker placed on the map layout.
 
 2. "destination_door_${destination}": The door/entrance of the room or facility labeled "${destination}" (or the closest match). The point should be at the doorway closest to the main corridor, NOT the center of the room.
 
