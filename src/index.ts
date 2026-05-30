@@ -221,6 +221,103 @@ function pickClosestAspectRatio(inputW: number, inputH: number): string {
 }
 
 /**
+ * 互相关平移对齐：把 mask 对齐到 input 的墙线。
+ * 在低分辨率（workW px 宽）下暴力搜索最优 (dx, dy)，再按比例放大到 mask 分辨率。
+ * 只做平移，不做缩放/旋转。
+ */
+async function alignMaskToInput(inputBuf: Buffer, maskBuf: Buffer, inputW: number, inputH: number): Promise<Buffer> {
+  const maskMeta = await sharp(maskBuf).metadata()
+  const maskW = maskMeta.width!
+  const maskH = maskMeta.height!
+
+  const workW = Math.min(400, inputW)
+  const workH = Math.round(inputH * workW / inputW)
+
+  const inputGray = await sharp(inputBuf).resize(workW, workH, { fit: 'fill' }).grayscale().raw().toBuffer()
+  const maskGray  = await sharp(maskBuf) .resize(workW, workH, { fit: 'fill' }).grayscale().raw().toBuffer()
+
+  const inputBin = new Uint8Array(workW * workH)
+  const maskBin  = new Uint8Array(workW * workH)
+  for (let i = 0; i < inputBin.length; i++) {
+    inputBin[i] = inputGray[i] < 100 ? 1 : 0
+  }
+  for (let i = 0; i < maskBin.length; i++) {
+    maskBin[i] = maskGray[i] < 100 ? 1 : 0
+  }
+
+  let inputDarkCount = 0
+  let maskDarkCount  = 0
+  for (let i = 0; i < inputBin.length; i++) {
+    if (inputBin[i]) inputDarkCount++
+  }
+  for (let i = 0; i < maskBin.length; i++) {
+    if (maskBin[i]) maskDarkCount++
+  }
+
+  if (inputDarkCount < 100 || maskDarkCount < 100) {
+    console.warn('Alignment skipped: too few dark pixels')
+    return maskBuf
+  }
+
+  let bestScore = -1
+  let bestDx = 0
+  let bestDy = 0
+
+  for (let dy = -15; dy <= 15; dy++) {
+    for (let dx = -15; dx <= 15; dx++) {
+      let score = 0
+      for (let y = 0; y < workH; y += 2) {
+        for (let x = 0; x < workW; x += 2) {
+          const x2 = x - dx, y2 = y - dy
+          if (x2 < 0 || x2 >= workW || y2 < 0 || y2 >= workH) continue
+          if (inputBin[y * workW + x] && maskBin[y2 * workW + x2]) score++
+        }
+      }
+      if (score > bestScore) { bestScore = score; bestDx = dx; bestDy = dy }
+    }
+  }
+
+  const confidence = bestScore / Math.max(1, inputDarkCount)
+  if (confidence < 0.05) {
+    console.warn(`Alignment skipped: low confidence ${confidence.toFixed(3)}`)
+    return maskBuf
+  }
+
+  const shiftX = Math.round(bestDx * maskW / workW)
+  const shiftY = Math.round(bestDy * maskH / workH)
+
+  if (Math.abs(bestDx) === 15 || Math.abs(bestDy) === 15) {
+    console.warn(`Alignment hit search boundary: dx=${bestDx} dy=${bestDy}`)
+  }
+
+  console.log(`Alignment: dx=${bestDx} dy=${bestDy} score=${bestScore} confidence=${confidence.toFixed(3)} shiftX=${shiftX} shiftY=${shiftY} applied=true`)
+
+  if (shiftX === 0 && shiftY === 0) return maskBuf
+
+  const alignedBuf = await sharp(maskBuf)
+    .extend({
+      left:   Math.max(0,  shiftX),
+      right:  Math.max(0, -shiftX),
+      top:    Math.max(0,  shiftY),
+      bottom: Math.max(0, -shiftY),
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
+    })
+    .extract({
+      left:   Math.max(0, -shiftX),
+      top:    Math.max(0, -shiftY),
+      width:  maskW,
+      height: maskH,
+    })
+    .png()
+    .toBuffer()
+
+  const outMeta = await sharp(alignedBuf).metadata()
+  if (outMeta.width !== maskW || outMeta.height !== maskH) throw new Error('Alignment output size mismatch')
+
+  return alignedBuf
+}
+
+/**
  * 从 data URL 解析图片宽高，使用 image-size 库正确处理各种 JPEG/PNG 格式。
  */
 function parseImageDimensions(dataUrl: string): { width: number; height: number } | null {
@@ -367,6 +464,10 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
     throw new Error('Image model did not return a generated image')
   }
 
+  // 提取原始输入 buffer，供互相关对齐使用
+  const inputBase64Match = imageDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+  const inputBuf = inputBase64Match ? Buffer.from(inputBase64Match[1], 'base64') : null
+
   // 如果做了 pad，需要 crop 回原始比例
   if (padLeft > 0 || padTop > 0) {
     const outMatch = outputDataUrl.match(/^data:image\/([^;]+);base64,(.+)$/)
@@ -385,11 +486,24 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
       const cropH = Math.round(dimensions.height * scaleY)
 
       console.log(`Cropping output ${outW}x${outH} -> ${cropW}x${cropH} (left=${cropLeft}, top=${cropTop})`)
-      const croppedBuf = await sharp(outBuf)
+      let croppedBuf = await sharp(outBuf)
         .extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
         .png()
         .toBuffer()
+
+      // 互相关平移对齐
+      if (inputBuf) {
+        croppedBuf = await alignMaskToInput(inputBuf, croppedBuf, dimensions.width, dimensions.height)
+      }
       outputDataUrl = `data:image/png;base64,${croppedBuf.toString('base64')}`
+    }
+  } else if (inputBuf) {
+    // 未做 pad 的情况（输入已是目标比例）：直接对齐
+    const outMatch = outputDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+    if (outMatch) {
+      const maskBuf = Buffer.from(outMatch[1], 'base64')
+      const alignedBuf = await alignMaskToInput(inputBuf, maskBuf, dimensions.width, dimensions.height)
+      outputDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
     }
   }
 
