@@ -295,7 +295,9 @@ async function alignMaskToInput(inputBuf: Buffer, maskBuf: Buffer, inputW: numbe
   if (shiftX === 0 && shiftY === 0) return maskBuf
 
   try {
-    const alignedBuf = await sharp(maskBuf)
+    // Sharp applies extract BEFORE extend in its pipeline regardless of call order,
+    // so we MUST split into two separate sharp() invocations to force the correct order.
+    const extendedBuf = await sharp(maskBuf)
       .extend({
         left:   Math.max(0,  shiftX),
         right:  Math.max(0, -shiftX),
@@ -303,6 +305,10 @@ async function alignMaskToInput(inputBuf: Buffer, maskBuf: Buffer, inputW: numbe
         bottom: Math.max(0, -shiftY),
         background: { r: 255, g: 255, b: 255, alpha: 1 },
       })
+      .png()
+      .toBuffer()
+
+    const alignedBuf = await sharp(extendedBuf)
       .extract({
         left:   Math.max(0, -shiftX),
         top:    Math.max(0, -shiftY),
