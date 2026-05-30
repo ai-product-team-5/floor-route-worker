@@ -532,7 +532,14 @@ app.post('/api/endpoints', async (c) => {
     // 使用 Qwen3-VL 原生 grounding 格式（point_2d，坐标范围 0~1000）
     const prompt = `Locate the following two points in this indoor floor plan image. Report point coordinates in JSON format.
 
-1. "current_position": Find the "You Are Here" / "当前位置" / "Current Location" marker WITHIN THE MAP AREA itself (NOT in the legend/key). This is typically a distinctive icon (colored dot, star ★, arrow ➤, person icon, or pin) placed on a corridor or room in the main floor plan drawing to show where the viewer is standing. IMPORTANT: Do NOT return coordinates of the legend/key area at the bottom or side of the image — only the actual marker placed on the map layout.
+1. "current_position": Find the "You Are Here" / "当前位置" / "Current Location" marker placed WITHIN THE MAP LAYOUT (among the rooms and corridors).
+
+How to find it:
+- Look at the legend/key area first to learn what the "当前位置" icon looks like (its shape and color). The legend usually shows a small sample icon next to the text "当前位置" or "Current Position" or "Entrance".
+- Then scan the MAIN MAP AREA (the area with room outlines and corridors) for that SAME icon. It will be placed somewhere on or near a corridor to indicate where the viewer is standing.
+- The marker could be: a triangle (▲, possibly rotated at any angle), a colored dot/circle, a star ★, an arrow ➤, a person icon, a pin, or any other distinctive symbol that differs from room labels.
+- The marker may be small and subtle — look carefully along corridors and near entrances.
+- Return the coordinates of this marker IN THE MAP AREA. NEVER return the coordinates of the legend/key area itself.
 
 2. "destination_door_${destination}": The door/entrance of the room or facility labeled "${destination}" (or the closest match). The point should be at the doorway closest to the main corridor, NOT the center of the room.
 
