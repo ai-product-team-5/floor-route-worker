@@ -294,27 +294,35 @@ async function alignMaskToInput(inputBuf: Buffer, maskBuf: Buffer, inputW: numbe
 
   if (shiftX === 0 && shiftY === 0) return maskBuf
 
-  const alignedBuf = await sharp(maskBuf)
-    .extend({
-      left:   Math.max(0,  shiftX),
-      right:  Math.max(0, -shiftX),
-      top:    Math.max(0,  shiftY),
-      bottom: Math.max(0, -shiftY),
-      background: { r: 255, g: 255, b: 255, alpha: 1 },
-    })
-    .extract({
-      left:   Math.max(0, -shiftX),
-      top:    Math.max(0, -shiftY),
-      width:  maskW,
-      height: maskH,
-    })
-    .png()
-    .toBuffer()
+  try {
+    const alignedBuf = await sharp(maskBuf)
+      .extend({
+        left:   Math.max(0,  shiftX),
+        right:  Math.max(0, -shiftX),
+        top:    Math.max(0,  shiftY),
+        bottom: Math.max(0, -shiftY),
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .extract({
+        left:   Math.max(0, -shiftX),
+        top:    Math.max(0, -shiftY),
+        width:  maskW,
+        height: maskH,
+      })
+      .png()
+      .toBuffer()
 
-  const outMeta = await sharp(alignedBuf).metadata()
-  if (outMeta.width !== maskW || outMeta.height !== maskH) throw new Error('Alignment output size mismatch')
+    const outMeta = await sharp(alignedBuf).metadata()
+    if (outMeta.width !== maskW || outMeta.height !== maskH) {
+      console.warn(`Alignment output size mismatch (got ${outMeta.width}x${outMeta.height}, expected ${maskW}x${maskH}), returning unaligned mask`)
+      return maskBuf
+    }
 
-  return alignedBuf
+    return alignedBuf
+  } catch (err) {
+    console.warn(`Alignment shift failed (${err instanceof Error ? err.message : String(err)}), returning unaligned mask`)
+    return maskBuf
+  }
 }
 
 /**
