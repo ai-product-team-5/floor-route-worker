@@ -354,223 +354,299 @@ async function darkPixelOverlapScore(
   return score
 }
 
-async function alignMaskToInputHomography(
+
+
+/**
+ * Align mask to photo via ECC (Enhanced Correlation Coefficient) on
+ * distance-transformed edge maps. Tries HOMOGRAPHY first, then EUCLIDEAN
+ * as fallback. Returns the warped mask at photo native resolution.
+ *
+ * Wave 1 probe verified convergence on the canonical pair: HOMOGRAPHY ecc≈0.84
+ * @ 800×559 work resolution (~2.4s), EUCLIDEAN ecc≈0.82 (~0.2s). See
+ * `.omo/notepads/ecc-alignment/learnings.md`.
+ */
+async function alignMaskToInputECC(
   inputBuf: Buffer,
   maskBuf: Buffer,
   inputW: number,
   inputH: number,
 ): Promise<{
   aligned: Buffer
-  method: 'homography' | 'none'
+  method: 'ecc-homography' | 'ecc-euclidean' | 'none'
   reason?: string
-  matches?: number
-  inliers?: number
-  det?: number
-  rotDeg?: number
+  warpMatrix?: number[][]
+  ecc?: number
 }> {
-  // Compute working resolution (cap at 800px wide)
-  let workW = Math.min(800, inputW)
-  if (inputW * inputH > 4_000_000) workW = 800
-  const workH = Math.round(inputH * (workW / inputW))
+  // Mask native dims (do NOT assume mask is at photo dims — caller may pass a
+  // mask of arbitrary size, e.g. 2382×1664 from a 1400×978 photo). Read for
+  // logging; sharp().resize handles any size mismatch implicitly below.
+  const maskMeta = await sharp(maskBuf).metadata()
+  const maskW = maskMeta.width!
+  const maskH = maskMeta.height!
 
-  // Get mask native dimensions
-  const { width: maskW, height: maskH } = await sharp(maskBuf).metadata()
+  // Work resolution (cap at 800px wide, proportional height)
+  const workW = Math.min(800, inputW)
+  const workH = Math.round(inputH * workW / inputW)
 
-  // Declare all cv objects upfront so finally block can always reference them
-  let srcMat: cv.Mat | null = null
-  let dstMat: cv.Mat | null = null
-  let srcGray: cv.Mat | null = null
-  let dstGray: cv.Mat | null = null
-  let srcKp: cv.KeyPointVector | null = null
-  let dstKp: cv.KeyPointVector | null = null
-  let srcDesc: cv.Mat | null = null
-  let dstDesc: cv.Mat | null = null
-  let noArrayMask1: cv.Mat | null = null
-  let noArrayMask2: cv.Mat | null = null
-  let matches: cv.DMatchVectorVector | null = null
-  let srcPts: cv.Mat | null = null
-  let dstPts: cv.Mat | null = null
-  let H: cv.Mat | null = null
-  let inlierMask: cv.Mat | null = null
-  let H_full: cv.Mat | null = null
+  // Declare every cv.Mat upfront so finally cleanup can always reference them.
+  let photoRgba: cv.Mat | null = null
+  let photoGray: cv.Mat | null = null
+  let photoCanny: cv.Mat | null = null
+  let photoCannyInv: cv.Mat | null = null
+  let photoDt: cv.Mat | null = null
+  let photoDistN: cv.Mat | null = null
+  let maskRgba: cv.Mat | null = null
+  let maskGray: cv.Mat | null = null
+  let maskBin: cv.Mat | null = null
+  let kernel: cv.Mat | null = null
+  let maskDilated: cv.Mat | null = null
+  let maskCanny: cv.Mat | null = null
+  let maskCannyInv: cv.Mat | null = null
+  let maskDt: cv.Mat | null = null
+  let maskDistN: cv.Mat | null = null
+  let warpH: cv.Mat | null = null
+  let warpE: cv.Mat | null = null
+  let warpFull: cv.Mat | null = null
   let maskMatFull: cv.Mat | null = null
   let warpedMat: cv.Mat | null = null
-  let orb: cv.ORB | null = null
-  let bf: cv.BFMatcher | null = null
 
   try {
-    // Resize both images to working resolution RGBA
-    const [inputResized, maskResized] = await Promise.all([
+    // Resize photo and mask to work resolution as RGBA for cv ingestion.
+    const [photoRaw, maskRaw] = await Promise.all([
       sharp(inputBuf).resize(workW, workH, { fit: 'fill' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
       sharp(maskBuf).resize(workW, workH, { fit: 'fill' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
     ])
+    photoRgba = cv.matFromArray(workH, workW, cv.CV_8UC4, photoRaw.data)
+    maskRgba = cv.matFromArray(workH, workW, cv.CV_8UC4, maskRaw.data)
 
-    // Convert to cv.Mat (RGBA)
-    srcMat = cv.matFromArray(workH, workW, cv.CV_8UC4, inputResized.data)
-    dstMat = cv.matFromArray(workH, workW, cv.CV_8UC4, maskResized.data)
+    // Photo: gray → Canny(50,150) → invert → distanceTransform → normalize
+    photoGray = new cv.Mat()
+    cv.cvtColor(photoRgba, photoGray, cv.COLOR_RGBA2GRAY)
+    photoCanny = new cv.Mat()
+    cv.Canny(photoGray, photoCanny, 50, 150)
+    photoCannyInv = new cv.Mat()
+    cv.bitwise_not(photoCanny, photoCannyInv)
+    photoDt = new cv.Mat()
+    cv.distanceTransform(photoCannyInv, photoDt, cv.DIST_L2, 5)
+    photoDistN = new cv.Mat()
+    cv.normalize(photoDt, photoDistN, 0.0, 1.0, cv.NORM_MINMAX, cv.CV_32F)
 
-    // Convert to grayscale
-    srcGray = new cv.Mat()
-    cv.cvtColor(srcMat, srcGray, cv.COLOR_RGBA2GRAY)
-    dstGray = new cv.Mat()
-    cv.cvtColor(dstMat, dstGray, cv.COLOR_RGBA2GRAY)
+    // Mask: gray → threshold(127) inverse → dilate(3×3, 1 iter) → Canny → invert
+    //       → distanceTransform → normalize. Walls in the mask are dark (low
+    //       grayscale) so THRESH_BINARY_INV makes wall pixels = 255 before edge
+    //       detection.
+    maskGray = new cv.Mat()
+    cv.cvtColor(maskRgba, maskGray, cv.COLOR_RGBA2GRAY)
+    maskBin = new cv.Mat()
+    cv.threshold(maskGray, maskBin, 127, 255, cv.THRESH_BINARY_INV)
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3))
+    maskDilated = new cv.Mat()
+    cv.dilate(maskBin, maskDilated, kernel, new cv.Point(-1, -1), 1)
+    maskCanny = new cv.Mat()
+    cv.Canny(maskDilated, maskCanny, 50, 150)
+    maskCannyInv = new cv.Mat()
+    cv.bitwise_not(maskCanny, maskCannyInv)
+    maskDt = new cv.Mat()
+    cv.distanceTransform(maskCannyInv, maskDt, cv.DIST_L2, 5)
+    maskDistN = new cv.Mat()
+    cv.normalize(maskDt, maskDistN, 0.0, 1.0, cv.NORM_MINMAX, cv.CV_32F)
 
-    // Detect keypoints and compute descriptors
-    orb = new cv.ORB(1000)
-    srcKp = new cv.KeyPointVector()
-    srcDesc = new cv.Mat()
-    noArrayMask1 = new cv.Mat()
-    orb.detectAndCompute(srcGray, noArrayMask1, srcKp, srcDesc)
-
-    dstKp = new cv.KeyPointVector()
-    dstDesc = new cv.Mat()
-    noArrayMask2 = new cv.Mat()
-    orb.detectAndCompute(dstGray, noArrayMask2, dstKp, dstDesc)
-
-    // Gate: too few features
-    if (srcKp.size() < 10 || dstKp.size() < 10) {
-      const reason = 'too_few_features'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
+    // --- Try HOMOGRAPHY first (criteria 100, 1e-4, gaussFiltSize=5 default) ---
+    warpH = cv.Mat.eye(3, 3, cv.CV_32F)
+    const critH = new cv.TermCriteria(cv.TermCriteria_EPS + cv.TermCriteria_COUNT, 100, 1e-4)
+    let homoEcc = -1
+    let homoOk = false
+    let homoReason = ''
+    const tHomo = Date.now()
+    try {
+      // 6-arg overload: omit inputMask + gaussFiltSize. gaussFiltSize defaults
+      // to 5 on the OpenCV side, matching the probe.
+      homoEcc = cv.findTransformECC(photoDistN, maskDistN, warpH, cv.MOTION_HOMOGRAPHY, critH)
+      homoOk = true
+    } catch (err) {
+      homoReason = classifyEccError(err)
     }
+    const homoMs = Date.now() - tHomo
 
-    // kNN match (k=2) for Lowe's ratio test
-    bf = new cv.BFMatcher(cv.NORM_HAMMING, false)
-    matches = new cv.DMatchVectorVector()
-    bf.knnMatch(dstDesc, srcDesc, matches, 2)
+    let methodChosen: 'ecc-homography' | 'ecc-euclidean' | 'none' = 'none'
+    let chosenEcc = -1
+    let chosenDet = 0
+    let chosenRotDeg = 0
+    let chosenTx = 0
+    let chosenTy = 0
+    let chosenMs = 0
+    let chosenWarp2D: number[][] = []
+    let chosenIs3x3 = true
 
-    // Lowe's ratio test 0.75 — build plain JS array to avoid DMatchVector API complexity
-    const goodMatches: Array<{ queryIdx: number; trainIdx: number }> = []
-    for (let i = 0; i < matches.size(); i++) {
-      const pair = matches.get(i)
-      if (pair.size() < 2) continue
-      const best = pair.get(0)
-      const second = pair.get(1)
-      if (best.distance < 0.75 * second.distance) {
-        goodMatches.push({ queryIdx: best.queryIdx, trainIdx: best.trainIdx })
+    if (homoOk) {
+      // Validate 3×3 warp: extract det, rotDeg, tx, ty from CV_32F row-major.
+      const wd = warpH.data32F
+      const h00 = wd[0], h01 = wd[1], h02 = wd[2]
+      const h10 = wd[3], h11 = wd[4], h12 = wd[5]
+      const h20 = wd[6], h21 = wd[7], h22 = wd[8]
+      const det = h00 * h11 - h01 * h10
+      const rotDeg = Math.atan2(h10, h00) * 180 / Math.PI
+      const tx = h02
+      const ty = h12
+
+      if (det < 0.7 || det > 1.3) {
+        homoOk = false
+        homoReason = `degenerate det=${det.toFixed(2)}`
+      } else if (Math.abs(rotDeg) >= 5) {
+        homoOk = false
+        homoReason = `degenerate rot=${rotDeg.toFixed(2)}`
+      } else if (Math.abs(tx) + Math.abs(ty) >= 100) {
+        homoOk = false
+        homoReason = `degenerate trans=${(Math.abs(tx) + Math.abs(ty)).toFixed(1)}`
+      } else {
+        methodChosen = 'ecc-homography'
+        chosenEcc = homoEcc
+        chosenDet = det
+        chosenRotDeg = rotDeg
+        chosenTx = tx
+        chosenTy = ty
+        chosenMs = homoMs
+        chosenIs3x3 = true
+        chosenWarp2D = [
+          [h00, h01, h02],
+          [h10, h11, h12],
+          [h20, h21, h22],
+        ]
       }
     }
 
-    // Gate: too few good matches
-    if (goodMatches.length < 10) {
-      const reason = 'too_few_matches'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason, matches: goodMatches.length }
+    // --- Fallback: EUCLIDEAN (criteria 50, 1e-3) ---
+    if (methodChosen === 'none') {
+      warpE = cv.Mat.eye(2, 3, cv.CV_32F)
+      const critE = new cv.TermCriteria(cv.TermCriteria_EPS + cv.TermCriteria_COUNT, 50, 1e-3)
+      let euEcc = -1
+      let euOk = false
+      let euReason = homoReason
+      const tEu = Date.now()
+      try {
+        euEcc = cv.findTransformECC(photoDistN, maskDistN, warpE, cv.MOTION_EUCLIDEAN, critE)
+        euOk = true
+      } catch (err) {
+        euReason = classifyEccError(err)
+      }
+      const euMs = Date.now() - tEu
+
+      if (euOk) {
+        // Validate 2×3 affine — same det/rot/translation gates as 3×3.
+        // Conceptually equivalent to appending [0,0,1] row before checking.
+        const ed = warpE.data32F
+        const a00 = ed[0], a01 = ed[1], a02 = ed[2]
+        const a10 = ed[3], a11 = ed[4], a12 = ed[5]
+        const det = a00 * a11 - a01 * a10
+        const rotDeg = Math.atan2(a10, a00) * 180 / Math.PI
+        const tx = a02
+        const ty = a12
+
+        if (det < 0.7 || det > 1.3) {
+          euReason = `degenerate det=${det.toFixed(2)}`
+        } else if (Math.abs(rotDeg) >= 5) {
+          euReason = `degenerate rot=${rotDeg.toFixed(2)}`
+        } else if (Math.abs(tx) + Math.abs(ty) >= 100) {
+          euReason = `degenerate trans=${(Math.abs(tx) + Math.abs(ty)).toFixed(1)}`
+        } else {
+          methodChosen = 'ecc-euclidean'
+          chosenEcc = euEcc
+          chosenDet = det
+          chosenRotDeg = rotDeg
+          chosenTx = tx
+          chosenTy = ty
+          chosenMs = euMs
+          chosenIs3x3 = false
+          chosenWarp2D = [
+            [a00, a01, a02],
+            [a10, a11, a12],
+          ]
+        }
+      }
+
+      if (methodChosen === 'none') {
+        const reason = euReason || homoReason || 'noConv'
+        console.log(`ECC: failed (reason: ${reason})`)
+        return { aligned: maskBuf, method: 'none', reason }
+      }
     }
 
-    // Build point arrays from keypoints
-    const srcPtsData: number[] = []
-    const dstPtsData: number[] = []
-    for (const m of goodMatches) {
-      const sp = srcKp.get(m.trainIdx).pt
-      const dp = dstKp.get(m.queryIdx).pt
-      srcPtsData.push(sp.x, sp.y)
-      dstPtsData.push(dp.x, dp.y)
-    }
-    srcPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPtsData)
-    dstPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPtsData)
-
-    // RANSAC homography
-    inlierMask = new cv.Mat()
-    H = cv.findHomography(srcPts, dstPts, cv.RANSAC, 5, inlierMask)
-
-    // Gate: RANSAC failed
-    if (H.empty()) {
-      const reason = 'ransac_failed'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
-    }
-
-    // Count inliers
-    let inlierCount = 0
-    for (let i = 0; i < inlierMask.rows; i++) {
-      if (inlierMask.data[i] !== 0) inlierCount++
-    }
-    const inlierRatio = inlierCount / goodMatches.length
-
-    // Gate: low inlier ratio
-    if (inlierRatio < 0.3) {
-      const reason = 'low_inlier_ratio'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
-    }
-
-    // Extract H values (row-major Float64Array)
-    const hd = H.data64F
-    const h00 = hd[0], h01 = hd[1], h02 = hd[2]
-    const h10 = hd[3], h11 = hd[4], h12 = hd[5]
-
-    // Derived metrics
-    const det = h00 * h11 - h01 * h10
-    const rotDeg = Math.atan2(h10, h00) * 180 / Math.PI
-    const tx = h02
-    const ty = h12
-
-    // Degenerate gates
-    if (det < 0.7 || det > 1.3) {
-      const reason = 'degenerate_H_det'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
-    }
-    if (Math.abs(rotDeg) >= 5) {
-      const reason = 'degenerate_H_rot'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
-    }
-    if (Math.hypot(tx, ty) * (maskW! / workW) >= 100) {
-      const reason = 'degenerate_H_trans'
-      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
-      return { aligned: maskBuf, method: 'none', reason }
-    }
-
-    // Scale H to mask native resolution
-    // H_full = S * H * S_inv  where S = diag(scaleW, scaleH, 1)
-    const scaleW = maskW! / workW
-    const scaleH = maskH! / workH
-    H_full = cv.matFromArray(3, 3, cv.CV_64F, [
-      h00,           h01,           h02 * scaleW,
-      h10,           h11,           h12 * scaleH,
-      hd[6] / scaleW, hd[7] / scaleH, hd[8],
-    ])
-
-    // Warp at full mask resolution
-    const { data: maskData, info: maskInfo } = await sharp(maskBuf)
+    // --- Apply warp at full input resolution ---
+    // Resize mask to photo dims first so the output matches photo dims (caller
+    // contract is identical to alignMaskToInput).
+    const { data: maskFullData, info: maskFullInfo } = await sharp(maskBuf)
+      .resize(inputW, inputH, { fit: 'fill' })
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true })
-    maskMatFull = cv.matFromArray(maskInfo.height, maskInfo.width, cv.CV_8UC4, maskData)
-    warpedMat = new cv.Mat()
-    cv.warpPerspective(
-      maskMatFull,
-      warpedMat,
-      H_full,
-      new cv.Size(maskInfo.width, maskInfo.height),
-      cv.INTER_LINEAR,
-      cv.BORDER_CONSTANT,
-      new cv.Scalar(255, 255, 255, 255),
-    )
+    maskMatFull = cv.matFromArray(maskFullInfo.height, maskFullInfo.width, cv.CV_8UC4, maskFullData)
 
-    // Convert warped Mat back to PNG Buffer
+    // Scale work-res warp to full-res. For nearly-identity matrices (det≈1,
+    // rot<2°) the cross-scale factors on h01/h10 are negligible, so we only
+    // scale the translation column and the perspective row per spec.
+    const sx = inputW / workW
+    const sy = inputH / workH
+
+    warpedMat = new cv.Mat()
+    if (chosenIs3x3) {
+      const r0 = chosenWarp2D[0]
+      const r1 = chosenWarp2D[1]
+      const r2 = chosenWarp2D[2]
+      warpFull = cv.matFromArray(3, 3, cv.CV_32F, [
+        r0[0],      r0[1],      r0[2] * sx,
+        r1[0],      r1[1],      r1[2] * sy,
+        r2[0] / sx, r2[1] / sy, r2[2],
+      ])
+      cv.warpPerspective(
+        maskMatFull,
+        warpedMat,
+        warpFull,
+        new cv.Size(inputW, inputH),
+        cv.INTER_LINEAR,
+        cv.BORDER_CONSTANT,
+        new cv.Scalar(255, 255, 255, 255),
+      )
+    } else {
+      const r0 = chosenWarp2D[0]
+      const r1 = chosenWarp2D[1]
+      warpFull = cv.matFromArray(2, 3, cv.CV_32F, [
+        r0[0], r0[1], r0[2] * sx,
+        r1[0], r1[1], r1[2] * sy,
+      ])
+      cv.warpAffine(
+        maskMatFull,
+        warpedMat,
+        warpFull,
+        new cv.Size(inputW, inputH),
+        cv.INTER_LINEAR,
+        cv.BORDER_CONSTANT,
+        new cv.Scalar(255, 255, 255, 255),
+      )
+    }
+
     const warpedBuf = await sharp(Buffer.from(warpedMat.data), {
-      raw: { width: maskInfo.width, height: maskInfo.height, channels: 4 },
+      raw: { width: inputW, height: inputH, channels: 4 },
     })
       .png()
       .toBuffer()
 
     console.log(
-      `Homography: matches=${goodMatches.length} inliers=${inlierCount}/${goodMatches.length} scale=${Math.sqrt(Math.abs(det)).toFixed(3)} rot=${rotDeg.toFixed(1)}deg det=${det.toFixed(3)} method=homography`,
+      `ECC: method=${methodChosen} ecc=${chosenEcc.toFixed(3)} det=${chosenDet.toFixed(3)} rotDeg=${chosenRotDeg.toFixed(2)} tx=${chosenTx.toFixed(1)} ty=${chosenTy.toFixed(1)} ms=${chosenMs} maskNative=${maskW}x${maskH}`,
     )
 
-    return { aligned: warpedBuf, method: 'homography', matches: goodMatches.length, inliers: inlierCount, det, rotDeg }
+    return {
+      aligned: warpedBuf,
+      method: methodChosen,
+      ecc: chosenEcc,
+      warpMatrix: chosenWarp2D,
+    }
   } finally {
     const toDelete: Array<{ delete: () => void } | null | undefined> = [
-      srcMat, dstMat, srcGray, dstGray,
-      srcKp, dstKp, srcDesc, dstDesc,
-      noArrayMask1, noArrayMask2,
-      matches, srcPts, dstPts,
-      H, inlierMask, H_full,
+      photoRgba, photoGray, photoCanny, photoCannyInv, photoDt, photoDistN,
+      maskRgba, maskGray, maskBin, kernel, maskDilated,
+      maskCanny, maskCannyInv, maskDt, maskDistN,
+      warpH, warpE, warpFull,
       maskMatFull, warpedMat,
-      orb, bf,
     ]
     for (const obj of toDelete) {
       try { obj?.delete() } catch {}
@@ -579,9 +655,30 @@ async function alignMaskToInputHomography(
 }
 
 /**
+ * Map an opencv-js exception to a stable reason tag. Emscripten may throw
+ * either an `Error`, a numeric pointer, or an object with `.msg`. We probe
+ * the message for the canonical "did not converge" / StsNoConv strings and
+ * return 'noConv' if matched, otherwise 'error'.
+ */
+function classifyEccError(err: unknown): string {
+  let msg = ''
+  if (err instanceof Error) {
+    msg = err.message
+  } else if (typeof err === 'object' && err !== null) {
+    const cand = err as { msg?: unknown; message?: unknown }
+    if (typeof cand.msg === 'string') msg = cand.msg
+    else if (typeof cand.message === 'string') msg = cand.message
+    else msg = String(err)
+  } else {
+    msg = String(err)
+  }
+  return /StsNoConv|did not converge|not converged|noConv/i.test(msg) ? 'noConv' : 'error'
+}
+
+/**
  * Run all three alignment candidates, score each, return the best.
  * Scores via darkPixelOverlapScore at work resolution (400px wide).
- * Tie-break: translation > homography > raw (most conservative wins).
+ * Tie-break: translation > ecc > raw (most conservative wins).
  */
 async function dispatchAlignment(
   inputBuf: Buffer,
@@ -596,31 +693,31 @@ async function dispatchAlignment(
     // Score raw mask as baseline
     const scoreRaw = await darkPixelOverlapScore(inputBuf, maskBuf, workW, workH)
 
-    // Try homography
-    let scoreHomo = -1
-    let homoBuf: Buffer = maskBuf
-    const homoResult = await alignMaskToInputHomography(inputBuf, maskBuf, inputW, inputH)
-    if (homoResult.method === 'homography') {
-      scoreHomo = await darkPixelOverlapScore(inputBuf, homoResult.aligned, workW, workH)
-      homoBuf = homoResult.aligned
+    // Try ECC alignment
+    let scoreEcc = -1
+    let eccBuf: Buffer = maskBuf
+    const eccResult = await alignMaskToInputECC(inputBuf, maskBuf, inputW, inputH)
+    if (eccResult.method === 'ecc-homography' || eccResult.method === 'ecc-euclidean') {
+      scoreEcc = await darkPixelOverlapScore(inputBuf, eccResult.aligned, workW, workH)
+      eccBuf = eccResult.aligned
     }
 
     // Try translation
     const transBuf = await alignMaskToInput(inputBuf, maskBuf, inputW, inputH)
     const scoreTrans = await darkPixelOverlapScore(inputBuf, transBuf, workW, workH)
 
-    // Pick winner (tie-break: trans > homo > raw)
-    let winner: 'raw' | 'trans' | 'homo'
+    // Pick winner (tie-break: trans > ecc > raw)
+    let winner: 'raw' | 'trans' | 'ecc'
     let resultBuf: Buffer
-    if (scoreTrans >= scoreHomo && scoreTrans >= scoreRaw) {
+    if (scoreTrans >= scoreEcc && scoreTrans >= scoreRaw) {
       winner = 'trans'; resultBuf = transBuf
-    } else if (scoreHomo >= scoreRaw) {
-      winner = 'homo'; resultBuf = homoBuf
+    } else if (scoreEcc >= scoreRaw) {
+      winner = 'ecc'; resultBuf = eccBuf
     } else {
       winner = 'raw'; resultBuf = maskBuf
     }
 
-    console.log(`Dispatch: scoreRaw=${scoreRaw} scoreTrans=${scoreTrans} scoreHomo=${scoreHomo} winner=${winner}`)
+    console.log(`Dispatch: scoreRaw=${scoreRaw} scoreTrans=${scoreTrans} scoreEcc=${scoreEcc} winner=${winner}`)
     return resultBuf
   } catch (err) {
     console.warn(`Dispatch failed: ${err instanceof Error ? err.message : String(err)}; returning raw mask`)
