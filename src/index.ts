@@ -461,7 +461,7 @@ async function alignMaskToInputECC(
     try {
       // 6-arg overload: omit inputMask + gaussFiltSize. gaussFiltSize defaults
       // to 5 on the OpenCV side, matching the probe.
-      homoEcc = cv.findTransformECC(photoDistN, maskDistN, warpH, cv.MOTION_HOMOGRAPHY, critH)
+      homoEcc = cv.findTransformECC(photoDistN, maskDistN, warpH, cv.MOTION_HOMOGRAPHY, critH, new cv.Mat(), 5)
       homoOk = true
     } catch (err) {
       homoReason = classifyEccError(err)
@@ -524,7 +524,7 @@ async function alignMaskToInputECC(
       let euReason = homoReason
       const tEu = Date.now()
       try {
-        euEcc = cv.findTransformECC(photoDistN, maskDistN, warpE, cv.MOTION_EUCLIDEAN, critE)
+        euEcc = cv.findTransformECC(photoDistN, maskDistN, warpE, cv.MOTION_EUCLIDEAN, critE, new cv.Mat(), 5)
         euOk = true
       } catch (err) {
         euReason = classifyEccError(err)
