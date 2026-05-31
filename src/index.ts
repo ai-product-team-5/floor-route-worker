@@ -5,6 +5,7 @@ import { createClient } from '@libsql/client'
 import { createHash, randomUUID } from 'node:crypto'
 import { imageSize } from 'image-size'
 import sharp from 'sharp'
+import cv from '@techstark/opencv-js'
 
 // --- Config from environment variables ---
 
@@ -332,6 +333,302 @@ async function alignMaskToInput(inputBuf: Buffer, maskBuf: Buffer, inputW: numbe
 }
 
 /**
+ * Score alignment quality by counting overlapping dark pixels at work resolution.
+ * Both buffers resized to (workW, workH), grayscale, binarized at threshold 100.
+ * Higher score = better alignment. Used by dispatchAlignment to pick the best candidate.
+ */
+async function darkPixelOverlapScore(
+  inputBuf: Buffer,
+  candidateBuf: Buffer,
+  workW: number,
+  workH: number,
+): Promise<number> {
+  const [inputRaw, candidateRaw] = await Promise.all([
+    sharp(inputBuf).resize(workW, workH, { fit: 'fill' }).grayscale().raw().toBuffer(),
+    sharp(candidateBuf).resize(workW, workH, { fit: 'fill' }).grayscale().raw().toBuffer(),
+  ])
+  let score = 0
+  for (let i = 0; i < inputRaw.length; i++) {
+    if (inputRaw[i] < 100 && candidateRaw[i] < 100) score++
+  }
+  return score
+}
+
+async function alignMaskToInputHomography(
+  inputBuf: Buffer,
+  maskBuf: Buffer,
+  inputW: number,
+  inputH: number,
+): Promise<{
+  aligned: Buffer
+  method: 'homography' | 'none'
+  reason?: string
+  matches?: number
+  inliers?: number
+  det?: number
+  rotDeg?: number
+}> {
+  // Compute working resolution (cap at 800px wide)
+  let workW = Math.min(800, inputW)
+  if (inputW * inputH > 4_000_000) workW = 800
+  const workH = Math.round(inputH * (workW / inputW))
+
+  // Get mask native dimensions
+  const { width: maskW, height: maskH } = await sharp(maskBuf).metadata()
+
+  // Declare all cv objects upfront so finally block can always reference them
+  let srcMat: cv.Mat | null = null
+  let dstMat: cv.Mat | null = null
+  let srcGray: cv.Mat | null = null
+  let dstGray: cv.Mat | null = null
+  let srcKp: cv.KeyPointVector | null = null
+  let dstKp: cv.KeyPointVector | null = null
+  let srcDesc: cv.Mat | null = null
+  let dstDesc: cv.Mat | null = null
+  let noArrayMask1: cv.Mat | null = null
+  let noArrayMask2: cv.Mat | null = null
+  let matches: cv.DMatchVectorVector | null = null
+  let srcPts: cv.Mat | null = null
+  let dstPts: cv.Mat | null = null
+  let H: cv.Mat | null = null
+  let inlierMask: cv.Mat | null = null
+  let H_full: cv.Mat | null = null
+  let maskMatFull: cv.Mat | null = null
+  let warpedMat: cv.Mat | null = null
+  let orb: cv.ORB | null = null
+  let bf: cv.BFMatcher | null = null
+
+  try {
+    // Resize both images to working resolution RGBA
+    const [inputResized, maskResized] = await Promise.all([
+      sharp(inputBuf).resize(workW, workH, { fit: 'fill' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
+      sharp(maskBuf).resize(workW, workH, { fit: 'fill' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }),
+    ])
+
+    // Convert to cv.Mat (RGBA)
+    srcMat = cv.matFromArray(workH, workW, cv.CV_8UC4, inputResized.data)
+    dstMat = cv.matFromArray(workH, workW, cv.CV_8UC4, maskResized.data)
+
+    // Convert to grayscale
+    srcGray = new cv.Mat()
+    cv.cvtColor(srcMat, srcGray, cv.COLOR_RGBA2GRAY)
+    dstGray = new cv.Mat()
+    cv.cvtColor(dstMat, dstGray, cv.COLOR_RGBA2GRAY)
+
+    // Detect keypoints and compute descriptors
+    orb = new cv.ORB(1000)
+    srcKp = new cv.KeyPointVector()
+    srcDesc = new cv.Mat()
+    noArrayMask1 = new cv.Mat()
+    orb.detectAndCompute(srcGray, noArrayMask1, srcKp, srcDesc)
+
+    dstKp = new cv.KeyPointVector()
+    dstDesc = new cv.Mat()
+    noArrayMask2 = new cv.Mat()
+    orb.detectAndCompute(dstGray, noArrayMask2, dstKp, dstDesc)
+
+    // Gate: too few features
+    if (srcKp.size() < 10 || dstKp.size() < 10) {
+      const reason = 'too_few_features'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+
+    // kNN match (k=2) for Lowe's ratio test
+    bf = new cv.BFMatcher(cv.NORM_HAMMING, false)
+    matches = new cv.DMatchVectorVector()
+    bf.knnMatch(dstDesc, srcDesc, matches, 2)
+
+    // Lowe's ratio test 0.75 — build plain JS array to avoid DMatchVector API complexity
+    const goodMatches: Array<{ queryIdx: number; trainIdx: number }> = []
+    for (let i = 0; i < matches.size(); i++) {
+      const pair = matches.get(i)
+      if (pair.size() < 2) continue
+      const best = pair.get(0)
+      const second = pair.get(1)
+      if (best.distance < 0.75 * second.distance) {
+        goodMatches.push({ queryIdx: best.queryIdx, trainIdx: best.trainIdx })
+      }
+    }
+
+    // Gate: too few good matches
+    if (goodMatches.length < 10) {
+      const reason = 'too_few_matches'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason, matches: goodMatches.length }
+    }
+
+    // Build point arrays from keypoints
+    const srcPtsData: number[] = []
+    const dstPtsData: number[] = []
+    for (const m of goodMatches) {
+      const sp = srcKp.get(m.trainIdx).pt
+      const dp = dstKp.get(m.queryIdx).pt
+      srcPtsData.push(sp.x, sp.y)
+      dstPtsData.push(dp.x, dp.y)
+    }
+    srcPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPtsData)
+    dstPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPtsData)
+
+    // RANSAC homography
+    inlierMask = new cv.Mat()
+    H = cv.findHomography(srcPts, dstPts, cv.RANSAC, 5, inlierMask)
+
+    // Gate: RANSAC failed
+    if (H.empty()) {
+      const reason = 'ransac_failed'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+
+    // Count inliers
+    let inlierCount = 0
+    for (let i = 0; i < inlierMask.rows; i++) {
+      if (inlierMask.data[i] !== 0) inlierCount++
+    }
+    const inlierRatio = inlierCount / goodMatches.length
+
+    // Gate: low inlier ratio
+    if (inlierRatio < 0.3) {
+      const reason = 'low_inlier_ratio'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+
+    // Extract H values (row-major Float64Array)
+    const hd = H.data64F
+    const h00 = hd[0], h01 = hd[1], h02 = hd[2]
+    const h10 = hd[3], h11 = hd[4], h12 = hd[5]
+
+    // Derived metrics
+    const det = h00 * h11 - h01 * h10
+    const rotDeg = Math.atan2(h10, h00) * 180 / Math.PI
+    const tx = h02
+    const ty = h12
+
+    // Degenerate gates
+    if (det < 0.7 || det > 1.3) {
+      const reason = 'degenerate_H_det'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+    if (Math.abs(rotDeg) >= 5) {
+      const reason = 'degenerate_H_rot'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+    if (Math.hypot(tx, ty) * (maskW! / workW) >= 100) {
+      const reason = 'degenerate_H_trans'
+      console.log(`Homography: failed (reason: ${reason}) — returning maskBuf for fallback chain`)
+      return { aligned: maskBuf, method: 'none', reason }
+    }
+
+    // Scale H to mask native resolution
+    // H_full = S * H * S_inv  where S = diag(scaleW, scaleH, 1)
+    const scaleW = maskW! / workW
+    const scaleH = maskH! / workH
+    H_full = cv.matFromArray(3, 3, cv.CV_64F, [
+      h00,           h01,           h02 * scaleW,
+      h10,           h11,           h12 * scaleH,
+      hd[6] / scaleW, hd[7] / scaleH, hd[8],
+    ])
+
+    // Warp at full mask resolution
+    const { data: maskData, info: maskInfo } = await sharp(maskBuf)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true })
+    maskMatFull = cv.matFromArray(maskInfo.height, maskInfo.width, cv.CV_8UC4, maskData)
+    warpedMat = new cv.Mat()
+    cv.warpPerspective(
+      maskMatFull,
+      warpedMat,
+      H_full,
+      new cv.Size(maskInfo.width, maskInfo.height),
+      cv.INTER_LINEAR,
+      cv.BORDER_CONSTANT,
+      new cv.Scalar(255, 255, 255, 255),
+    )
+
+    // Convert warped Mat back to PNG Buffer
+    const warpedBuf = await sharp(Buffer.from(warpedMat.data), {
+      raw: { width: maskInfo.width, height: maskInfo.height, channels: 4 },
+    })
+      .png()
+      .toBuffer()
+
+    console.log(
+      `Homography: matches=${goodMatches.length} inliers=${inlierCount}/${goodMatches.length} scale=${Math.sqrt(Math.abs(det)).toFixed(3)} rot=${rotDeg.toFixed(1)}deg det=${det.toFixed(3)} method=homography`,
+    )
+
+    return { aligned: warpedBuf, method: 'homography', matches: goodMatches.length, inliers: inlierCount, det, rotDeg }
+  } finally {
+    const toDelete: Array<{ delete: () => void } | null | undefined> = [
+      srcMat, dstMat, srcGray, dstGray,
+      srcKp, dstKp, srcDesc, dstDesc,
+      noArrayMask1, noArrayMask2,
+      matches, srcPts, dstPts,
+      H, inlierMask, H_full,
+      maskMatFull, warpedMat,
+      orb, bf,
+    ]
+    for (const obj of toDelete) {
+      try { obj?.delete() } catch {}
+    }
+  }
+}
+
+/**
+ * Run all three alignment candidates, score each, return the best.
+ * Scores via darkPixelOverlapScore at work resolution (400px wide).
+ * Tie-break: translation > homography > raw (most conservative wins).
+ */
+async function dispatchAlignment(
+  inputBuf: Buffer,
+  maskBuf: Buffer,
+  inputW: number,
+  inputH: number,
+): Promise<Buffer> {
+  try {
+    const workW = Math.min(400, inputW)
+    const workH = Math.round(inputH * workW / inputW)
+
+    // Score raw mask as baseline
+    const scoreRaw = await darkPixelOverlapScore(inputBuf, maskBuf, workW, workH)
+
+    // Try homography
+    let scoreHomo = -1
+    let homoBuf: Buffer = maskBuf
+    const homoResult = await alignMaskToInputHomography(inputBuf, maskBuf, inputW, inputH)
+    if (homoResult.method === 'homography') {
+      scoreHomo = await darkPixelOverlapScore(inputBuf, homoResult.aligned, workW, workH)
+      homoBuf = homoResult.aligned
+    }
+
+    // Try translation
+    const transBuf = await alignMaskToInput(inputBuf, maskBuf, inputW, inputH)
+    const scoreTrans = await darkPixelOverlapScore(inputBuf, transBuf, workW, workH)
+
+    // Pick winner (tie-break: trans > homo > raw)
+    let winner: 'raw' | 'trans' | 'homo'
+    let resultBuf: Buffer
+    if (scoreTrans >= scoreHomo && scoreTrans >= scoreRaw) {
+      winner = 'trans'; resultBuf = transBuf
+    } else if (scoreHomo >= scoreRaw) {
+      winner = 'homo'; resultBuf = homoBuf
+    } else {
+      winner = 'raw'; resultBuf = maskBuf
+    }
+
+    console.log(`Dispatch: scoreRaw=${scoreRaw} scoreTrans=${scoreTrans} scoreHomo=${scoreHomo} winner=${winner}`)
+    return resultBuf
+  } catch (err) {
+    console.warn(`Dispatch failed: ${err instanceof Error ? err.message : String(err)}; returning raw mask`)
+    return maskBuf
+  }
+}
+
+/**
  * 从 data URL 解析图片宽高，使用 image-size 库正确处理各种 JPEG/PNG 格式。
  */
 function parseImageDimensions(dataUrl: string): { width: number; height: number } | null {
@@ -507,7 +804,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
 
       // 互相关平移对齐
       if (inputBuf) {
-        croppedBuf = await alignMaskToInput(inputBuf, croppedBuf, dimensions.width, dimensions.height)
+        croppedBuf = await dispatchAlignment(inputBuf, croppedBuf, dimensions.width, dimensions.height)
       }
       outputDataUrl = `data:image/png;base64,${croppedBuf.toString('base64')}`
     }
@@ -516,7 +813,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
     const outMatch = outputDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
     if (outMatch) {
       const maskBuf = Buffer.from(outMatch[1], 'base64')
-      const alignedBuf = await alignMaskToInput(inputBuf, maskBuf, dimensions.width, dimensions.height)
+      const alignedBuf = await dispatchAlignment(inputBuf, maskBuf, dimensions.width, dimensions.height)
       outputDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
     }
   }
@@ -964,7 +1261,37 @@ function fallbackResult(message: string): EndpointResult {
 
 // --- Start server ---
 
+let cvInitialized = false
+
+async function initOpenCV(): Promise<void> {
+  if (cvInitialized) return
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    // Handle both: cv is a Promise (some builds) or cv has onRuntimeInitialized callback
+    const cvModule = cv as unknown as { onRuntimeInitialized?: () => void; Mat?: unknown } | Promise<unknown>
+    if (cvModule instanceof Promise) {
+      cvModule.then(() => resolve()).catch(reject)
+    } else if ((cvModule as { Mat?: unknown }).Mat) {
+      // Already initialized
+      resolve()
+    } else {
+      (cvModule as { onRuntimeInitialized: () => void }).onRuntimeInitialized = resolve
+    }
+  })
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('OpenCV WASM init timeout after 10s')), 10_000)
+  )
+  try {
+    await Promise.race([readyPromise, timeout])
+    cvInitialized = true
+    console.log('OpenCV WASM initialized')
+  } catch (err) {
+    console.error('OpenCV init failed:', err)
+    process.exit(1)
+  }
+}
+
 await initDb()
+await initOpenCV()
 console.log(`FloorRoute API starting on port ${PORT}`)
 const server = serve({ fetch: app.fetch, port: PORT })
 ;(server as any).requestTimeout = 600_000
