@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { imageSize } from 'image-size'
 import sharp from 'sharp'
 import cv from '@techstark/opencv-js'
-import { preprocessImage, cropPadding } from './imagePreprocess'
+// imagePreprocess is no longer used — redraw and walls both use fixed 3:4 canvas
 
 // --- Config from environment variables ---
 
@@ -1056,8 +1056,8 @@ async function processWallsTask(
   imageDataUrl: string,
 ) {
   try {
-    const { paddedDataUrl, padInfo } = await preprocessImage(imageDataUrl)
-    console.log(`Walls: preprocessed to ${padInfo.paddedW}x${padInfo.paddedH} (${padInfo.aspectRatio})`)
+    // Compress input (the redrawn image) for the model
+    const compressedInput = await compressForModel(imageDataUrl, 2048)
 
     const wallsPrompt = `将这张建筑平面图转换为纯二值墙体掩码图。图中墙体已经是完整的黑色线条，你只需要删除非墙体元素。
 
@@ -1074,21 +1074,21 @@ async function processWallsTask(
 
 不要输出任何文字，只输出掩码图像。`
 
-    const rawOutput = await callImageModel(wallsPrompt, paddedDataUrl, padInfo.aspectRatio)
-    let wallMaskDataUrl = await cropPadding(rawOutput, padInfo)
+    const rawOutput = await callImageModel(wallsPrompt, compressedInput, '3:4')
+    let wallMaskDataUrl = rawOutput
 
-    // Cross-correlation alignment against the input (redrawn) image
-    const inputBase64Match = imageDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
-    if (inputBase64Match) {
-      const inputBuf = Buffer.from(inputBase64Match[1], 'base64')
+    // Alignment: resize mask to match the input image dimensions
+    const inputDims = parseImageDimensions(imageDataUrl)
+    const maskDims = parseImageDimensions(wallMaskDataUrl)
+    if (inputDims && maskDims && (maskDims.width !== inputDims.width || maskDims.height !== inputDims.height)) {
       const maskBase64Match = wallMaskDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
       if (maskBase64Match) {
         const maskBuf = Buffer.from(maskBase64Match[1], 'base64')
-        const inputDims = parseImageDimensions(imageDataUrl)
-        if (inputDims) {
-          const alignedBuf = await dispatchAlignment(inputBuf, maskBuf, inputDims.width, inputDims.height)
-          wallMaskDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
-        }
+        const resizedBuf = await sharp(maskBuf)
+          .resize(inputDims.width, inputDims.height, { fit: 'fill' })
+          .png()
+          .toBuffer()
+        wallMaskDataUrl = `data:image/png;base64,${resizedBuf.toString('base64')}`
       }
     }
 
