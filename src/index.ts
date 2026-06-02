@@ -718,7 +718,58 @@ function parseImageDimensions(dataUrl: string): { width: number; height: number 
   }
 }
 
+/**
+ * Compress an image data URL to fit within maxDim on its longest side.
+ * Returns a JPEG data URL to reduce payload size for the model API.
+ */
+async function compressForModel(dataUrl: string, maxDim: number): Promise<string> {
+  const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+  if (!base64Match) return dataUrl
+
+  const inputBuf = Buffer.from(base64Match[1], 'base64')
+  const metadata = await sharp(inputBuf).metadata()
+  const width = metadata.width || maxDim
+  const height = metadata.height || maxDim
+
+  const scale = Math.min(1, maxDim / Math.max(width, height))
+  if (scale >= 1) {
+    // Already within size limits, just re-encode as JPEG for consistency
+    const jpegBuf = await sharp(inputBuf).jpeg({ quality: 85 }).toBuffer()
+    return `data:image/jpeg;base64,${jpegBuf.toString('base64')}`
+  }
+
+  const newW = Math.round(width * scale)
+  const newH = Math.round(height * scale)
+
+  const jpegBuf = await sharp(inputBuf)
+    .resize(newW, newH, { fit: 'inside' })
+    .jpeg({ quality: 85 })
+    .toBuffer()
+
+  return `data:image/jpeg;base64,${jpegBuf.toString('base64')}`
+}
+
 async function callImageModel(prompt: string, imageDataUrl: string, aspectRatio: string): Promise<string> {
+  const maxRetries = 2
+  let lastError: Error | null = null
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await callImageModelOnce(prompt, imageDataUrl, aspectRatio)
+    } catch (error: any) {
+      lastError = error
+      const msg = error?.message || ''
+      // Only retry on network-level failures, not on 4xx API errors
+      const isNetworkError = msg === 'fetch failed' || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('UND_ERR')
+      if (!isNetworkError || attempt === maxRetries - 1) throw error
+      console.error(`Model request failed (attempt ${attempt + 1}/${maxRetries}): ${msg}, retrying...`)
+      await new Promise(r => setTimeout(r, 3000))
+    }
+  }
+  throw lastError!
+}
+
+async function callImageModelOnce(prompt: string, imageDataUrl: string, aspectRatio: string): Promise<string> {
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
     {
@@ -1059,10 +1110,12 @@ async function processWallsTask(
 
 async function processRedrawTask(taskId: string, apiKeyId: string, generationId: string, imageDataUrl: string) {
   try {
-    const { paddedDataUrl, padInfo } = await preprocessImage(imageDataUrl)
-    console.log(`Redraw: preprocessed to ${padInfo.paddedW}x${padInfo.paddedH} (${padInfo.aspectRatio})`)
+    // Compress input image for the model (max 2048px on longest side)
+    const compressedInput = await compressForModel(imageDataUrl, 2048)
 
     const redrawPrompt = `你是一名专业的建筑制图师。你的任务是将输入的平面图照片重绘为一张干净、标准的建筑平面图。
+
+输出画布为 3:4 竖版比例，请将平面图完整绘制在画布中央，确保所有内容不被截断，四周留出适当边距。
 
 绘制顺序：先绘制所有墙体结构（外墙、内墙、隔断），再补充其他平面图元素（门、窗、房间编号、设施标注）。
 
@@ -1080,12 +1133,11 @@ async function processRedrawTask(taskId: string, apiKeyId: string, generationId:
 - 如果原图中存在"当前位置"标记（如箭头、星号、"您在这里"等），必须在重绘图中原位置使用醒目的红色实心圆点标出，并在图例区域中添加对应说明（红色实心圆点 = 当前位置）
 - 不得添加、删除或移动任何结构元素或标注
 - 不得改变平面图的拓扑关系或房间连通性
-- 输出必须保持与输入相同的空间比例和相对距离
 
 只输出图像，不要附带任何文字。`
 
-    const rawOutput = await callImageModel(redrawPrompt, paddedDataUrl, padInfo.aspectRatio)
-    const redrawnImageDataUrl = await cropPadding(rawOutput, padInfo)
+    const rawOutput = await callImageModel(redrawPrompt, compressedInput, '3:4')
+    const redrawnImageDataUrl = rawOutput
 
     await markSucceeded(generationId)
     await db.execute({
