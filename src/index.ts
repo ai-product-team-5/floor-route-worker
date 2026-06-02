@@ -718,37 +718,6 @@ function parseImageDimensions(dataUrl: string): { width: number; height: number 
   }
 }
 
-/**
- * Compress an image data URL to fit within maxDim on its longest side.
- * Returns a JPEG data URL to reduce payload size for the model API.
- */
-async function compressForModel(dataUrl: string, maxDim: number): Promise<string> {
-  const base64Match = dataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
-  if (!base64Match) return dataUrl
-
-  const inputBuf = Buffer.from(base64Match[1], 'base64')
-  const metadata = await sharp(inputBuf).metadata()
-  const width = metadata.width || maxDim
-  const height = metadata.height || maxDim
-
-  const scale = Math.min(1, maxDim / Math.max(width, height))
-  if (scale >= 1) {
-    // Already within size limits, just re-encode as JPEG for consistency
-    const jpegBuf = await sharp(inputBuf).jpeg({ quality: 85 }).toBuffer()
-    return `data:image/jpeg;base64,${jpegBuf.toString('base64')}`
-  }
-
-  const newW = Math.round(width * scale)
-  const newH = Math.round(height * scale)
-
-  const jpegBuf = await sharp(inputBuf)
-    .resize(newW, newH, { fit: 'inside' })
-    .jpeg({ quality: 85 })
-    .toBuffer()
-
-  return `data:image/jpeg;base64,${jpegBuf.toString('base64')}`
-}
-
 async function callImageModel(prompt: string, imageDataUrl: string, aspectRatio: string): Promise<string> {
   const maxRetries = 2
   let lastError: Error | null = null
@@ -1056,9 +1025,6 @@ async function processWallsTask(
   imageDataUrl: string,
 ) {
   try {
-    // Compress input (the redrawn image) for the model
-    const compressedInput = await compressForModel(imageDataUrl, 2048)
-
     const wallsPrompt = `将这张建筑平面图转换为纯二值墙体掩码图。图中墙体已经是完整的黑色线条，你只需要删除非墙体元素。
 
 严格输出规则：
@@ -1074,21 +1040,21 @@ async function processWallsTask(
 
 不要输出任何文字，只输出掩码图像。`
 
-    const rawOutput = await callImageModel(wallsPrompt, compressedInput, '3:4')
+    const rawOutput = await callImageModel(wallsPrompt, imageDataUrl, '3:4')
     let wallMaskDataUrl = rawOutput
 
-    // Alignment: resize mask to match the input image dimensions
-    const inputDims = parseImageDimensions(imageDataUrl)
-    const maskDims = parseImageDimensions(wallMaskDataUrl)
-    if (inputDims && maskDims && (maskDims.width !== inputDims.width || maskDims.height !== inputDims.height)) {
+    // Resize mask to match input dimensions if needed, then align via cross-correlation
+    const inputBase64Match = imageDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+    if (inputBase64Match) {
+      const inputBuf = Buffer.from(inputBase64Match[1], 'base64')
       const maskBase64Match = wallMaskDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
       if (maskBase64Match) {
         const maskBuf = Buffer.from(maskBase64Match[1], 'base64')
-        const resizedBuf = await sharp(maskBuf)
-          .resize(inputDims.width, inputDims.height, { fit: 'fill' })
-          .png()
-          .toBuffer()
-        wallMaskDataUrl = `data:image/png;base64,${resizedBuf.toString('base64')}`
+        const inputDims = parseImageDimensions(imageDataUrl)
+        if (inputDims) {
+          const alignedBuf = await dispatchAlignment(inputBuf, maskBuf, inputDims.width, inputDims.height)
+          wallMaskDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
+        }
       }
     }
 
@@ -1110,9 +1076,6 @@ async function processWallsTask(
 
 async function processRedrawTask(taskId: string, apiKeyId: string, generationId: string, imageDataUrl: string) {
   try {
-    // Compress input image for the model (max 2048px on longest side)
-    const compressedInput = await compressForModel(imageDataUrl, 2048)
-
     const redrawPrompt = `你是一名专业的建筑制图师。你的任务是将输入的平面图照片重绘为一张干净、标准的建筑平面图。
 
 输出画布为 3:4 竖版比例，请将平面图完整绘制在画布中央，确保所有内容不被截断，四周留出适当边距。
@@ -1136,7 +1099,7 @@ async function processRedrawTask(taskId: string, apiKeyId: string, generationId:
 
 只输出图像，不要附带任何文字。`
 
-    const rawOutput = await callImageModel(redrawPrompt, compressedInput, '3:4')
+    const rawOutput = await callImageModel(redrawPrompt, imageDataUrl, '3:4')
     const redrawnImageDataUrl = rawOutput
 
     await markSucceeded(generationId)
