@@ -1076,7 +1076,25 @@ async function processWallsTask(
 
 async function processRedrawTask(taskId: string, apiKeyId: string, generationId: string, imageDataUrl: string) {
   try {
-    const redrawPrompt = `将输入的平面图照片重绘为干净的标准建筑平面图。
+    // Step 1: Ask VLM to analyze the floor plan and generate drawing guidance
+    const analysisPrompt = `分析这张平面图照片，输出3-5条简短的绘制要点，帮助将其重绘为标准建筑平面图。
+重点描述：
+- 建筑整体形状（矩形/L形/圆弧/不规则等）
+- "当前位置"标记的外观和位置（如有）
+- 需要特别注意保留的结构特征或文字信息
+
+每条一句话，不超过5条。只输出要点列表，不要其他内容。`
+
+    let analysisNotes = ''
+    try {
+      analysisNotes = await callVisionRaw(analysisPrompt, imageDataUrl)
+      console.log('Redraw analysis:', analysisNotes.slice(0, 200))
+    } catch (e: any) {
+      console.warn('Redraw VLM analysis failed, proceeding without:', e?.message)
+    }
+
+    // Step 2: Build final prompt with analysis notes appended
+    let redrawPrompt = `将输入的平面图照片重绘为干净的标准建筑平面图。
 
 输出画布为 3:4 竖版比例。保持原图中各结构的比例关系不变，将平面图完整绘制在画布中央，不得截断任何内容。
 
@@ -1091,6 +1109,10 @@ async function processRedrawTask(taskId: string, apiKeyId: string, generationId:
 - 不得添加、删除或移动任何结构元素，不得改变拓扑关系
 
 只输出图像。`
+
+    if (analysisNotes.trim()) {
+      redrawPrompt += `\n\n以下是对这张具体平面图的补充说明：\n${analysisNotes.trim()}`
+    }
 
     const rawOutput = await callImageModel(redrawPrompt, imageDataUrl, '3:4')
     const redrawnImageDataUrl = rawOutput
