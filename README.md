@@ -88,7 +88,7 @@ npm run dev
 | `DB_URL` | SQLite 数据库路径 | `file:./data/floor-route.db` |
 | `VISION_MODEL_BASE_URL` | 视觉模型 API 地址 | `https://openrouter.ai/api/v1` |
 | `VISION_MODEL_API_KEY` | 视觉模型 API Key | `sk-or-xxx` |
-| `VISION_MODEL_NAME` | 视觉模型名称 | `qwen/qwen2.5-vl-72b-instruct` |
+| `VISION_MODEL_NAME` | 视觉模型名称 | `qwen/qwen3-vl-235b-a22b-instruct` |
 | `IMAGE_MODEL_BASE_URL` | 图像生成模型 API 地址 | `https://openrouter.ai/api/v1` |
 | `IMAGE_MODEL_API_KEY` | 图像生成模型 API Key | `sk-or-xxx` |
 | `IMAGE_MODEL_NAME` | 图像生成模型名称 | `openai/gpt-5.4-image-2` |

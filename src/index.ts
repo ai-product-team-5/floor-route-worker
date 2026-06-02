@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { imageSize } from 'image-size'
 import sharp from 'sharp'
 import cv from '@techstark/opencv-js'
+import { preprocessImage, cropPadding } from './imagePreprocess'
 
 // --- Config from environment variables ---
 
@@ -193,33 +194,7 @@ async function callVisionJson(prompt: string, imageDataUrl: string): Promise<any
   }
 }
 
-/**
- * 选择最接近输入宽高比的 aspect_ratio。
- * OpenRouter image_config 支持: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3
- */
-function pickClosestAspectRatio(inputW: number, inputH: number): string {
-  const ratio = inputW / inputH
-  const options: [number, string][] = [
-    [1, '1:1'],
-    [16 / 9, '16:9'],
-    [9 / 16, '9:16'],
-    [4 / 3, '4:3'],
-    [3 / 4, '3:4'],
-    [3 / 2, '3:2'],
-    [2 / 3, '2:3'],
-  ]
 
-  let best = '1:1'
-  let bestDiff = Infinity
-  for (const [r, label] of options) {
-    const diff = Math.abs(ratio - r)
-    if (diff < bestDiff) {
-      bestDiff = diff
-      best = label
-    }
-  }
-  return best
-}
 
 /**
  * 互相关平移对齐：把 mask 对齐到 input 的墙线。
@@ -743,81 +718,7 @@ function parseImageDimensions(dataUrl: string): { width: number; height: number 
   }
 }
 
-async function callImageWallMask(imageDataUrl: string): Promise<string> {
-  const prompt = `你正在分析一张室内平面图。你的任务是输出一张**纯黑白二值化的墙体掩码图**，用于后续算法寻路。
-
-## 最重要的约束（违反则输出无效）
-
-输出图必须与输入图**像素级空间对齐**：
-- 输出图的分辨率必须与输入图**完全相同**（相同的宽度和高度像素数）
-- 每一面墙在输出图中的位置必须与输入图中**完全对应**——如果在输入图中某面墙的左端点在 (100, 200)，那么输出图中该墙的黑色像素也必须从 (100, 200) 开始
-- 不要缩放、偏移、旋转、裁剪或添加任何边距
-- 把输入图想象成一个图层，你的输出是另一个图层——两者叠加时墙线必须完全重合
-
-## 输出规则
-
-- 仅使用两种颜色：纯黑 (#000000) 和 纯白 (#FFFFFF)，禁止任何灰色/抗锯齿/中间色
-- **墙壁 = 黑色**：所有不可通行的实体墙线，保持原图中墙线的精确位置和粗细
-- **可通行区域 = 白色**：走廊、房间内部、门洞、室外区域
-- 门洞必须保留为白色（让走廊与房间在掩码上保持连通）
-- 删除所有文字、数字、房间标签、图例、家具、装饰图标、指北针、比例尺
-- 删除所有"当前位置"标记和图例图标
-- 不要画任何路径、箭头、起点终点标记
-- 不要保留原图的颜色、底纹、阴影
-
-## 质量检查
-
-最终图必须满足：
-1. 与原图叠加时，黑色墙线精确覆盖原图的墙体线条
-2. 沿任何走廊放一个像素，都能通过白色像素连通到任意房间门口
-3. 房间之间通过门洞而不是墙壁连接
-
-只输出图像，不要附带任何文字说明。`
-
-  // 从 data URL 解析图片尺寸，选择最接近的 aspect_ratio
-  const dimensions = parseImageDimensions(imageDataUrl)
-  if (!dimensions) {
-    throw new Error('无法解析输入图片尺寸')
-  }
-  const aspectRatio = pickClosestAspectRatio(dimensions.width, dimensions.height)
-  console.log(`Input dimensions: ${dimensions.width}x${dimensions.height}, selected aspect_ratio: ${aspectRatio}`)
-
-  // 把输入图 pad 到目标 aspect ratio（白色填充），保证输入输出同比例
-  const [arW, arH] = aspectRatio.split(':').map(Number)
-  const targetRatio = arW / arH
-  const inputRatio = dimensions.width / dimensions.height
-  let padLeft = 0, padTop = 0, paddedW = dimensions.width, paddedH = dimensions.height
-
-  if (inputRatio < targetRatio) {
-    // 需要加宽
-    paddedW = Math.round(dimensions.height * targetRatio)
-    padLeft = Math.round((paddedW - dimensions.width) / 2)
-  } else if (inputRatio > targetRatio) {
-    // 需要加高
-    paddedH = Math.round(dimensions.width / targetRatio)
-    padTop = Math.round((paddedH - dimensions.height) / 2)
-  }
-
-  let inputToSend = imageDataUrl
-  if (padLeft > 0 || padTop > 0) {
-    const base64Match = imageDataUrl.match(/^data:image\/([^;]+);base64,(.+)$/)
-    if (base64Match) {
-      const inputBuf = Buffer.from(base64Match[2], 'base64')
-      const paddedBuf = await sharp(inputBuf)
-        .extend({
-          top: padTop,
-          bottom: paddedH - dimensions.height - padTop,
-          left: padLeft,
-          right: paddedW - dimensions.width - padLeft,
-          background: { r: 255, g: 255, b: 255, alpha: 1 },
-        })
-        .png()
-        .toBuffer()
-      inputToSend = `data:image/png;base64,${paddedBuf.toString('base64')}`
-      console.log(`Padded to ${paddedW}x${paddedH} (pad left=${padLeft}, top=${padTop})`)
-    }
-  }
-
+async function callImageModel(prompt: string, imageDataUrl: string, aspectRatio: string): Promise<string> {
   const response = await fetch(
     `${IMAGE_MODEL_BASE_URL.replace(/\/+$/, '')}/chat/completions`,
     {
@@ -839,7 +740,7 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
             role: 'user',
             content: [
               { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: inputToSend } },
+              { type: 'image_url', image_url: { url: imageDataUrl } },
             ],
           },
         ],
@@ -868,53 +769,22 @@ async function callImageWallMask(imageDataUrl: string): Promise<string> {
       }
     }
   }
+  // Fallback: extract HTTP image URL from markdown or plain text content
+  if (!outputDataUrl) {
+    const contentStr = typeof message?.content === 'string' ? message.content : ''
+    const urlMatch = contentStr.match(/https?:\/\/[^\s)]+\.(?:png|jpg|jpeg|webp)/i)
+    if (urlMatch) {
+      const imgResponse = await fetch(urlMatch[0], { signal: AbortSignal.timeout(60_000) })
+      if (imgResponse.ok) {
+        const imgBuf = Buffer.from(await imgResponse.arrayBuffer())
+        const contentType = imgResponse.headers.get('content-type') || 'image/png'
+        outputDataUrl = `data:${contentType};base64,${imgBuf.toString('base64')}`
+      }
+    }
+  }
   if (!outputDataUrl) {
     throw new Error('Image model did not return a generated image')
   }
-
-  // 提取原始输入 buffer，供互相关对齐使用
-  const inputBase64Match = imageDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
-  const inputBuf = inputBase64Match ? Buffer.from(inputBase64Match[1], 'base64') : null
-
-  // 如果做了 pad，需要 crop 回原始比例
-  if (padLeft > 0 || padTop > 0) {
-    const outMatch = outputDataUrl.match(/^data:image\/([^;]+);base64,(.+)$/)
-    if (outMatch) {
-      const outBuf = Buffer.from(outMatch[2], 'base64')
-      const outMeta = await sharp(outBuf).metadata()
-      const outW = outMeta.width!
-      const outH = outMeta.height!
-
-      // 按比例计算 crop 区域
-      const scaleX = outW / paddedW
-      const scaleY = outH / paddedH
-      const cropLeft = Math.round(padLeft * scaleX)
-      const cropTop = Math.round(padTop * scaleY)
-      const cropW = Math.round(dimensions.width * scaleX)
-      const cropH = Math.round(dimensions.height * scaleY)
-
-      console.log(`Cropping output ${outW}x${outH} -> ${cropW}x${cropH} (left=${cropLeft}, top=${cropTop})`)
-      let croppedBuf = await sharp(outBuf)
-        .extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
-        .png()
-        .toBuffer()
-
-      // 互相关平移对齐
-      if (inputBuf) {
-        croppedBuf = await dispatchAlignment(inputBuf, croppedBuf, dimensions.width, dimensions.height)
-      }
-      outputDataUrl = `data:image/png;base64,${croppedBuf.toString('base64')}`
-    }
-  } else if (inputBuf) {
-    // 未做 pad 的情况（输入已是目标比例）：直接对齐
-    const outMatch = outputDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
-    if (outMatch) {
-      const maskBuf = Buffer.from(outMatch[1], 'base64')
-      const alignedBuf = await dispatchAlignment(inputBuf, maskBuf, dimensions.width, dimensions.height)
-      outputDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
-    }
-  }
-
   return outputDataUrl
 }
 
@@ -1073,6 +943,29 @@ app.post('/api/search', async (c) => {
   })
 })
 
+// --- Async floor plan redraw ---
+
+app.post('/api/redraw', async (c) => {
+  const body = await c.req.json().catch(() => null)
+  if (!body || !isDataUrl(body.imageDataUrl)) {
+    return jsonError(c, 400, 'invalid_request', 'Invalid request: missing imageDataUrl.')
+  }
+  const apiKey = c.get('apiKey') as ApiKeyContext
+  const generationId = await createGeneration(apiKey.id, '/api/redraw')
+  const deducted = await deductOneCredit(apiKey.id, generationId)
+  if (!deducted) {
+    await markFailedNoRefund(generationId, 'insufficient_credits')
+    return jsonError(c, 402, 'insufficient_credits', 'Insufficient credits.')
+  }
+  const taskId = newId('task')
+  await db.execute({
+    sql: 'INSERT INTO tasks (id, api_key_id, status, created_at) VALUES (?, ?, \'processing\', ?)',
+    args: [taskId, apiKey.id, nowUnix()],
+  })
+  void processRedrawTask(taskId, apiKey.id, generationId, body.imageDataUrl)
+  return c.json({ taskId, message: 'Floor plan redraw started.' })
+})
+
 // --- Async wall mask generation ---
 
 app.post('/api/walls', async (c) => {
@@ -1112,7 +1005,42 @@ async function processWallsTask(
   imageDataUrl: string,
 ) {
   try {
-    const wallMaskDataUrl = await callImageWallMask(imageDataUrl)
+    const { paddedDataUrl, padInfo } = await preprocessImage(imageDataUrl)
+    console.log(`Walls: preprocessed to ${padInfo.paddedW}x${padInfo.paddedH} (${padInfo.aspectRatio})`)
+
+    const wallsPrompt = `将这张建筑平面图转换为纯二值墙体掩码图。图中墙体已经是完整的黑色线条，你只需要删除非墙体元素。
+
+严格输出规则：
+- 仅使用两种颜色：纯黑 (#000000) 和纯白 (#FFFFFF)
+- 零容忍灰色像素、抗锯齿、渐变或任何中间值
+- 黑色 = 墙体线条。保留输入图中已有的墙体线条，位置和粗细不变
+- 白色 = 所有可通行空间（走廊、房间内部、室外区域、门洞）
+- 门的开口（缺口、弧线、开向标识）必须渲染为白色，以保持房间与走廊的连通性
+- 门的弧线不要绘制，涂为白色
+- 将所有非墙体元素涂为白色：文字、标注、数字、门的弧线、窗户标记、家具图标
+- 输出图像必须与输入图像尺寸完全一致
+- 不得移动、添加或修改任何墙体线条的位置
+
+不要输出任何文字，只输出掩码图像。`
+
+    const rawOutput = await callImageModel(wallsPrompt, paddedDataUrl, padInfo.aspectRatio)
+    let wallMaskDataUrl = await cropPadding(rawOutput, padInfo)
+
+    // Cross-correlation alignment against the input (redrawn) image
+    const inputBase64Match = imageDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+    if (inputBase64Match) {
+      const inputBuf = Buffer.from(inputBase64Match[1], 'base64')
+      const maskBase64Match = wallMaskDataUrl.match(/^data:image\/[^;]+;base64,(.+)$/)
+      if (maskBase64Match) {
+        const maskBuf = Buffer.from(maskBase64Match[1], 'base64')
+        const inputDims = parseImageDimensions(imageDataUrl)
+        if (inputDims) {
+          const alignedBuf = await dispatchAlignment(inputBuf, maskBuf, inputDims.width, inputDims.height)
+          wallMaskDataUrl = `data:image/png;base64,${alignedBuf.toString('base64')}`
+        }
+      }
+    }
+
     await markSucceeded(generationId)
     await db.execute({
       sql: 'UPDATE tasks SET status = \'completed\', result_image_url = ?, finished_at = ? WHERE id = ?',
@@ -1121,6 +1049,52 @@ async function processWallsTask(
   } catch (error: any) {
     const errorMsg = error?.message || 'unknown'
     console.error('Wall mask generation failed:', errorMsg)
+    await markFailedAndRefund(apiKeyId, generationId, errorMsg)
+    await db.execute({
+      sql: 'UPDATE tasks SET status = \'failed\', error_message = ?, finished_at = ? WHERE id = ?',
+      args: [errorMsg.slice(0, 1000), nowUnix(), taskId],
+    })
+  }
+}
+
+async function processRedrawTask(taskId: string, apiKeyId: string, generationId: string, imageDataUrl: string) {
+  try {
+    const { paddedDataUrl, padInfo } = await preprocessImage(imageDataUrl)
+    console.log(`Redraw: preprocessed to ${padInfo.paddedW}x${padInfo.paddedH} (${padInfo.aspectRatio})`)
+
+    const redrawPrompt = `你是一名专业的建筑制图师。你的任务是将输入的平面图照片重绘为一张干净、标准的建筑平面图。
+
+绘制顺序：先绘制所有墙体结构（外墙、内墙、隔断），再补充其他平面图元素（门、窗、房间编号、设施标注）。
+
+要求：
+- 修正所有残留的透视畸变、镜头扭曲和几何倾斜，确保所有墙线在应当正交的地方完全横平竖直
+- 去除所有拍摄痕迹：阴影、反光、眩光、光照不均、纸张纹理、折痕、背景噪声
+- 去除装饰性配色、渐变填充、美化修饰，只保留平面图的功能性内容
+- 去除装饰性元素：边框、校徽、标题、指北针、定位标记
+- 墙体线条使用较粗的黑色实线绘制，确保墙体在视觉上最为突出
+- 使用纯白背景、黑色线条（标准建筑制图风格）
+- 完整保留所有墙体结构：外墙、内墙、隔断，墙体线条必须完整、连续、无断裂
+- 在墙体基础上补充：门的开启弧线、窗户标记、房间编号、设施名称标注（使用比墙体更细的线条）
+- 保留所有文字标注：房间编号、房间名称、设施名称
+- 保留图例区域（如有），用于标识设施图标含义
+- 如果原图中存在"当前位置"标记（如箭头、星号、"您在这里"等），必须在重绘图中原位置使用醒目的红色实心圆点标出，并在图例区域中添加对应说明（红色实心圆点 = 当前位置）
+- 不得添加、删除或移动任何结构元素或标注
+- 不得改变平面图的拓扑关系或房间连通性
+- 输出必须保持与输入相同的空间比例和相对距离
+
+只输出图像，不要附带任何文字。`
+
+    const rawOutput = await callImageModel(redrawPrompt, paddedDataUrl, padInfo.aspectRatio)
+    const redrawnImageDataUrl = await cropPadding(rawOutput, padInfo)
+
+    await markSucceeded(generationId)
+    await db.execute({
+      sql: 'UPDATE tasks SET status = \'completed\', result_image_url = ?, finished_at = ? WHERE id = ?',
+      args: [redrawnImageDataUrl, nowUnix(), taskId],
+    })
+  } catch (error: any) {
+    const errorMsg = error?.message || 'unknown'
+    console.error('Floor plan redraw failed:', errorMsg)
     await markFailedAndRefund(apiKeyId, generationId, errorMsg)
     await db.execute({
       sql: 'UPDATE tasks SET status = \'failed\', error_message = ?, finished_at = ? WHERE id = ?',
@@ -1149,7 +1123,8 @@ app.get('/api/task/:id', async (c) => {
     return c.json({
       status: 'completed',
       wallMaskDataUrl: row.result_image_url as string,
-      message: 'Wall mask generated.',
+      redrawnImageDataUrl: row.result_image_url as string,
+      message: 'Task completed.',
     })
   }
 
